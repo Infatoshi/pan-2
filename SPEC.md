@@ -106,11 +106,33 @@ camera (camera CE over 21 bins is a later option).
 ```
 /data/pan-2/raw/           # source mp4+jsonl (existing)
 /data/pan-2/episodes/      # source img.npy + act.npy (existing)
-/data/pan-2/shards/      # train-ready (to create)
-~/dev/pan-2/data/        # local experiment artifacts
+/data/pan-2/shards/        # train-ready packed shards (built)
+~/dev/pan-2/data/          # local experiment artifacts
 ```
 
-v0 training can read `/data/pan-2/episodes` for post-train and synthetic tensors for unit tests. Full scrape/latent pipeline is data work (user freeing space on the side).
+### Shard format (`pan2/data/shards.py`, version 1)
+
+Single ingest format for both stages; written by
+`scripts/build_shards.py` (from `episodes/` npy pairs, or from `raw/` mp4
+with optional recode to a new image size).
+
+```
+shards/
+  manifest.jsonl          # header row + one segment row per episode
+  shard-00000.frames.npy  # uint8 (T, H, W, 3), npy memmap
+  shard-00000.act.npy     # float32 (T, 25), same frame offsets
+```
+
+Episodes never straddle shards; act rows share frame offsets so one index
+serves pretrain and posttrain. `pan2.data.build.episode_dataset(cfg)` picks
+ShardDataset when `data_dir/manifest.jsonl` exists, else VPTEpisodeDataset;
+both share the windowing contract in `pan2/data/windowing.py` (future goal,
+hard negative, action chunk). The GPU ring loader (`prefer_source: shard`,
+default `auto` prefers shards when present) fills clips straight from shard
+mmaps. 64px build: 24 shards, ~8.16M frames, ~113 h.
+
+Training code reads shards for both stages; the per-episode npy dir stays as
+rebuild source. Full scrape/latent pipeline is data work (user freeing space on the side).
 
 ### Data acquisition (the gap that matters)
 

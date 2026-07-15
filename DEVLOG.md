@@ -286,3 +286,29 @@ on one GPU. Read the journal (verified 2026-07-15). Key facts vs our repo:
   binding constraint. SPEC gains "Stage A v1: Pan-1 alignment" + a data
   acquisition section with ordering. README now states the repro mission and
   the honest gap table. Model work ahead of the data gap is premature.
+
+## 2026-07-15 — shard format: single ingest for both stages
+
+Built the packed shard pipeline and populated /data/pan-2/shards.
+
+- Format (`pan2/data/shards.py`, v1): manifest.jsonl header + segment rows;
+  shard-NNNNN.frames.npy uint8 memmap + .act.npy float32, shared frame
+  offsets. Episodes never straddle shards. `ShardWriter` rejects mixed
+  act/no-act builds eagerly and validates shape/size/dtype per episode.
+- `pan2/data/windowing.py`: the sampling contract (window span, future goal
+  gap, hard-neg gap, action chunk start) extracted so VPTEpisodeDataset and
+  ShardDataset cannot drift apart. Selector `pan2/data/build.py` returns
+  ShardDataset iff data_dir has a manifest.
+- Ring loader: prefer_source gains "shard" (auto prefers shards when a
+  manifest exists); producers mmap-slice at segment offset. Train scripts
+  (pretrain/posttrain) and bench_pretrain route through the selector;
+  bench auto-detects format from --data.
+- Full build: 1625 episodes -> 24 shards, 8,155,382 frames = 113.3h,
+  93.3GiB frames bytes, 95G on disk. Byte-identity spot check vs the source
+  episode pair passes; ring-over-shards: 1546 usable items, 0 fill errors,
+  0.50 ms/batch steady reads. Posttrain overfit through the shard path
+  (GPU1): loss 0.36 -> 0.12 over 200 steps, matching the npy-path numbers.
+
+Note: this is repackaging, NOT acquisition. The 500k h video gap stands.
+The build script's --source raw branch recodes from the 640x360 mp4s and is
+the funnel for new scraped video (also enables a true 128px build).

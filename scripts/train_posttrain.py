@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 
 from pan2.config import load_config
 from pan2.data.synthetic import SyntheticGoalDataset
-from pan2.data.vpt_episodes import VPTEpisodeDataset
 from pan2.train.loop import build_state, infinite_loader, load_ckpt, save_ckpt, train_steps
 
 
@@ -34,16 +33,9 @@ def main() -> None:
             n_discrete=cfg.model.n_discrete,
         )
     else:
-        ds = VPTEpisodeDataset(
-            cfg.train.data_dir,
-            context_len=cfg.model.context_len,
-            action_chunk=cfg.model.action_chunk,
-            image_size=cfg.model.image_size,
-            keep_uint8=cfg.train.keep_uint8,
-            max_episodes=cfg.train.max_episodes,
-            min_goal_horizon=cfg.train.min_goal_horizon,
-            max_goal_horizon=cfg.train.max_goal_horizon,
-        )
+        from pan2.data.build import episode_dataset
+
+        ds = episode_dataset(cfg)
     loader = DataLoader(
         ds,
         batch_size=cfg.train.batch_size,

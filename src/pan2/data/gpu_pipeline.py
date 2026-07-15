@@ -24,18 +24,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from pan2.data.shards import MANIFEST_NAME, load_manifest
+
 
 @dataclass
 class PipelineConfig:
     raw_dir: str = "/data/pan-2/raw"
     episodes_dir: str = "/data/pan-2/episodes"
+    shards_dir: str = "/data/pan-2/shards"
     batch_size: int = 32
     context_len: int = 128
     frame_subsample: int = 2  # 20Hz data -> ~10fps effective tokens
     image_size: int = 64
     budget_gb: float = 10.0
     num_producers: int = 8
-    prefer_source: str = "auto"  # auto | mp4 | npy
+    prefer_source: str = "auto"  # auto | shard | mp4 | npy
     device: str = "cuda"
     seed: int = 0
     # goal = frame strictly after the context window, horizon in native frames
@@ -217,6 +220,7 @@ class _Producer(threading.Thread):
         self.stats = stats
         self.lock = lock
         self.rng = random.Random(cfg.seed + id(self) % 10000)
+        self._shard_cache: dict[int, np.ndarray] = {}
 
     def run(self) -> None:
         t_full = self.cfg.context_len
@@ -257,6 +261,16 @@ class _Producer(threading.Thread):
                 raise RuntimeError(f"short npy {img_path.name} T={t}")
             start = self.rng.randint(0, t - t_load)
             window = np.ascontiguousarray(frames[start : start + t_load])  # T,H,W,C
+        elif src == "shard":
+            shard = int(item["shard"])
+            if shard not in self._shard_cache:
+                p = Path(item["dir"]) / f"shard-{shard:05d}.frames.npy"
+                self._shard_cache[shard] = np.load(p, mmap_mode="r")
+            frames = self._shard_cache[shard]
+            t = int(item["n_frames"])
+            off = int(item["offset"])
+            start = self.rng.randint(0, t - t_load)
+            window = np.ascontiguousarray(frames[off + start : off + start + t_load])
         else:
             mp4 = Path(item["mp4"])
             # sample start; unknown length — use act/jsonl length if present else 0..large
@@ -295,7 +309,8 @@ class PipelinedGpuPretrainLoader:
         self.items = self._discover_items()
         if not self.items:
             raise FileNotFoundError(
-                f"no clips under raw={cfg.raw_dir} episodes={cfg.episodes_dir}"
+                f"no clips under raw={cfg.raw_dir} episodes={cfg.episodes_dir} "
+                f"shards={cfg.shards_dir}"
             )
 
         idxs = _subsample_indices(cfg.context_len, cfg.frame_subsample)
@@ -321,9 +336,21 @@ class PipelinedGpuPretrainLoader:
         self._wait_for_fill()
 
     def _discover_items(self) -> list[dict]:
+        prefer = self.cfg.prefer_source
+        shards = Path(self.cfg.shards_dir)
+        if prefer in ("auto", "shard") and (shards / MANIFEST_NAME).exists():
+            items = self._shard_items(shards)
+            if items:
+                return items
+            if prefer == "shard":
+                raise FileNotFoundError(
+                    f"shard source requested but no usable segments under {shards}"
+                )
+        elif prefer == "shard":
+            raise FileNotFoundError(f"shard source requested but no manifest under {shards}")
+
         raw = Path(self.cfg.raw_dir)
         eps = Path(self.cfg.episodes_dir)
-        prefer = self.cfg.prefer_source
         items: list[dict] = []
 
         mp4s = {p.stem: p for p in raw.glob("*.mp4")} if raw.is_dir() else {}
@@ -372,6 +399,32 @@ class PipelinedGpuPretrainLoader:
                 else:
                     rec["max_start"] = 4000
             items.append(rec)
+        return items
+
+    def _shard_items(self, shards: Path) -> list[dict]:
+        """Items from a packed shard build; segments shorter than t_load are skipped."""
+        header, segments = load_manifest(shards)
+        if int(header["image_size"]) != self.cfg.image_size:
+            raise ValueError(
+                f"shards are {header['image_size']}px, loader asked {self.cfg.image_size}"
+            )
+        t_load = self.cfg.context_len + 2 * self.cfg.max_goal_horizon
+        items: list[dict] = []
+        for seg in segments:
+            t = int(seg["n_frames"])
+            if t < t_load:
+                continue
+            items.append(
+                {
+                    "stem": seg["stem"],
+                    "source": "shard",
+                    "dir": str(shards),
+                    "shard": int(seg["shard"]),
+                    "offset": int(seg["offset"]),
+                    "n_frames": t,
+                    "max_start": t - t_load,
+                }
+            )
         return items
 
     def _wait_for_fill(self, timeout_s: float = 120.0) -> None:

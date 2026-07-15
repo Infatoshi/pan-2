@@ -19,7 +19,7 @@ def main() -> None:
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--budget-gb", type=float, default=10.0)
     p.add_argument("--producers", type=int, default=8)
-    p.add_argument("--prefer-source", default="auto", choices=["auto", "npy", "mp4"])
+    p.add_argument("--prefer-source", default="auto", choices=["auto", "shard", "npy", "mp4"])
     args = p.parse_args()
 
     cfg = load_config(args.config)

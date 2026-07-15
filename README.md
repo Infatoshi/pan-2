@@ -40,7 +40,26 @@ UV manages the environment (`uv run` everywhere, never bare pip).
 
 ## Data
 
-VPT-style episodes as paired numpy files in one directory:
+Train-ready packed shards (`src/pan2/data/shards.py`, version 1):
+
+```
+shards/
+  manifest.jsonl          # header + one segment row per episode
+  shard-00000.frames.npy  # uint8 (T, H, W, 3) frames, npy memmap
+  shard-00000.act.npy     # float32 (T, 25) actions, same frame offsets
+```
+
+Episodes never straddle shards. `src/pan2/data/build.py` picks the shard
+dataset when `data_dir/manifest.jsonl` exists, else falls back to the
+per-episode format below. Build shards from either source:
+
+```bash
+uv run python scripts/build_shards.py --source episodes --episodes-dir <dir> --out <out>
+uv run python scripts/build_shards.py --source raw --raw-dir <dir> --out <out> --image-size 128
+```
+
+Source format (what `build_shards.py` ingests) — VPT-style episodes as
+paired numpy files in one directory:
 
 ```
 episodes/
@@ -54,10 +73,10 @@ Action layout (25 dims, measured against raw VPT jsonl, see
 data), cols 23-24 camera dx/dy quantized to 0.1 steps in [-1, 1].
 
 Optional raw mp4+jsonl (same stems, sibling dir) enables the ffmpeg producer
-in the GPU pipeline; the npy path is the default and is what we benchmark.
+in the GPU pipeline.
 
-Point `train.data_dir` at your episodes dir (config or defaults assume
-`/data/pan-2/episodes`).
+Point `train.data_dir` at your shards dir (config defaults assume
+`/data/pan-2/shards`).
 
 ## Quickstart
 
@@ -81,7 +100,10 @@ src/pan2/
   actions.py          # measured VPT action layout (single source of truth)
   config.py           # dataclass configs, yaml loading
   data/
-    vpt_episodes.py   # mmap episode dataset (future goals, hard negatives)
+    shards.py         # packed shard writer/reader (single ingest format)
+    windowing.py      # shared window sampling contract (goal, neg, chunk)
+    build.py          # picks ShardDataset vs VPTEpisodeDataset by manifest
+    vpt_episodes.py   # per-episode npy dataset (fallback source)
     gpu_pipeline.py   # GPU-resident clip ring with async producers
     synthetic.py      # plumbing fixtures (shape-matched, unlearnable by design)
   models/

@@ -36,6 +36,7 @@ model churn.
 ## Data
 - Canonical train data: `/data/pan-2/` (symlink: `~/dev/pan-2/data/vpt`)
   - `episodes/` — 1625 clean img.npy+act.npy pairs (~113h @ 20Hz, 64x64, act dim 25)
+  - `shards/` — packed train data (24 shards, 8.16M frames, built 2026-07-15; train scripts read this)
   - `raw/` — matching mp4+jsonl for good stems
   - `meta/` — manifest + cleanup report
 - Local artifacts: `~/dev/pan-2/data/{checkpoints,cache,shards}`

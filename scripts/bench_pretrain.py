@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from pan2.config import ModelConfig
+from pan2.data.shards import MANIFEST_NAME, ShardDataset
 from pan2.data.synthetic import synthetic_batch
 from pan2.data.vpt_episodes import VPTEpisodeDataset
 from pan2.models.policy import PanPolicy
@@ -74,16 +75,20 @@ def main() -> None:
         backbone="transformer",
     )
 
-    ds = VPTEpisodeDataset(
+    data_root = Path(args.data)
+    cls = ShardDataset if (data_root / MANIFEST_NAME).exists() else VPTEpisodeDataset
+    ds = cls(
         args.data,
         context_len=args.context_len,
         action_chunk=10,
         image_size=args.image_size,
         keep_uint8=keep_uint8,
     )
+    n_eps = len(ds.pairs) if hasattr(ds, "pairs") else len(ds.segments)
     print(
-        f"pairs={len(ds.pairs)} T={args.context_len} img={args.image_size} "
-        f"bs={args.batch_size} keep_uint8={keep_uint8} compile={args.compile}"
+        f"dataset={cls.__name__} episodes={n_eps} T={args.context_len} "
+        f"img={args.image_size} bs={args.batch_size} keep_uint8={keep_uint8} "
+        f"compile={args.compile}"
     )
 
     loader = DataLoader(

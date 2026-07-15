@@ -6,30 +6,21 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from pan2.actions import MOUSE_DIM
+from pan2.data.windowing import (
+    frames_to_tensor,
+    sample_window,
+    split_actions,
+    window_need,
+)
 
 
 class VPTEpisodeDataset(Dataset):
     """Read preprocessed VPT episodes: `*.img.npy` + matching `*.act.npy`.
 
     Returns frames/goal as uint8 NCHW for cheap H2D; normalize/resize on GPU.
-
-    Goal sampling (fixed 2026-07-15): the goal is a FUTURE frame strictly past
-    the context window: goal_idx = start + context_len - 1 + horizon, with
-    horizon ~ U(min_goal_horizon, max_goal_horizon) native frames. The previous
-    version used the last context frame as the goal, which collapses Stage-A
-    contrastive pretraining to duplicate detection.
-
-    Hard negative: each sample also returns `neg`, a frame from the SAME
-    episode strictly beyond the goal window (idx >= context_end + max_horizon
-    + 1). Scene statistics persist within an episode, so this distractor
-    defeats trivial scene-ID matching that in-batch (cross-episode) negatives
-    allow.
-
-    Windows are returned FULL-RATE; temporal subsampling happens once, either
-    on-GPU in PanPolicy (this path) or at ring fill time (gpu_pipeline path).
-    Passing subsampled windows through a subsampling model used to double-apply
-    the stride.
+    Goal/neg/action sampling contract: see pan2.data.windowing (strictly
+    future goals, same-episode hard negatives, full-rate windows; temporal
+    subsampling happens once, in PanPolicy or at ring fill time).
     """
 
     def __init__(
@@ -74,9 +65,7 @@ class VPTEpisodeDataset(Dataset):
         return len(self.pairs) * self.windows_per_episode
 
     def _need(self) -> int:
-        # context + largest reach of action chunk, goal, or hard negative
-        stretch = max(self.action_chunk, 2 * self.max_goal_horizon)
-        return self.context_len - 1 + stretch + 1
+        return window_need(self.context_len, self.action_chunk, self.max_goal_horizon)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         img_path, act_path = self.pairs[idx % len(self.pairs)]
@@ -93,25 +82,22 @@ class VPTEpisodeDataset(Dataset):
         else:
             frames_np = frames
             acts_np = acts
-        start = int(np.random.randint(0, t - need + 1))
-        # Copy slice so tensor is writable and independent of mmap.
-        window = np.ascontiguousarray(frames_np[start : start + self.context_len])
-        horizon = int(np.random.randint(self.min_goal_horizon, self.max_goal_horizon + 1))
-        goal_idx = start + self.context_len - 1 + horizon
-        goal = np.ascontiguousarray(frames_np[goal_idx])
-        # hard negative: same episode, strictly beyond the goal window
-        neg_off = int(np.random.randint(1, self.max_goal_horizon + 1))
-        neg_idx = start + self.context_len - 1 + self.max_goal_horizon + neg_off
-        neg = np.ascontiguousarray(frames_np[neg_idx])
-        act_w = np.ascontiguousarray(
-            acts_np[
-                start + self.context_len - 1 : start + self.context_len - 1 + self.action_chunk
-            ]
+        w = sample_window(
+            t,
+            self.context_len,
+            self.action_chunk,
+            self.min_goal_horizon,
+            self.max_goal_horizon,
         )
-        frames_t = self._frames_to_tensor(window)
-        goal_t = self._frames_to_tensor(goal[None, ...])[0]
-        neg_t = self._frames_to_tensor(neg[None, ...])[0]
-        discrete, mouse = self._split_actions(act_w)
+        # Copy slices so tensors are writable and independent of mmap.
+        window = np.ascontiguousarray(frames_np[w.start : w.start + self.context_len])
+        goal = np.ascontiguousarray(frames_np[w.goal_idx])
+        neg = np.ascontiguousarray(frames_np[w.neg_idx])
+        act_w = np.ascontiguousarray(acts_np[w.act_start : w.act_start + self.action_chunk])
+        frames_t = frames_to_tensor(window, self.keep_uint8)
+        goal_t = frames_to_tensor(goal[None, ...], self.keep_uint8)[0]
+        neg_t = frames_to_tensor(neg[None, ...], self.keep_uint8)[0]
+        discrete, mouse = split_actions(act_w)
         return {
             "frames": frames_t,
             "goal": goal_t,
@@ -119,41 +105,3 @@ class VPTEpisodeDataset(Dataset):
             "discrete": discrete,
             "mouse": mouse,
         }
-
-    def _frames_to_tensor(self, arr: np.ndarray) -> torch.Tensor:
-        """NHWC numpy -> NCHW torch. uint8 by default (no CPU float/resize)."""
-        x = np.ascontiguousarray(arr)
-        if x.ndim == 3:
-            x = x[None, ...]
-        # NHWC -> NCHW
-        x = np.transpose(x, (0, 3, 1, 2))
-        if self.keep_uint8:
-            if x.dtype != np.uint8:
-                if x.max() <= 1.0:
-                    x = (x * 255.0).clip(0, 255).astype(np.uint8)
-                else:
-                    x = x.clip(0, 255).astype(np.uint8)
-            return torch.from_numpy(x.copy())  # uint8 NCHW, writable
-        # legacy float path (CPU normalize; still no resize — GPU does it)
-        t = torch.from_numpy(x.copy())
-        if t.dtype == torch.uint8:
-            t = t.float().div_(255.0)
-        else:
-            t = t.float()
-            if float(t.max()) > 1.5:
-                t = t / 255.0
-        return t
-
-    def _split_actions(self, act: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        # Layout measured from data (see pan2.actions): cols 0-22 binary
-        # buttons, cols 23-24 camera dx/dy in 0.1 steps over [-1, 1].
-        a = torch.from_numpy(np.array(act, copy=True, order="C")).float()
-        if a.ndim == 1:
-            a = a.unsqueeze(0)
-        if a.shape[-1] >= 3:
-            mouse = a[:, -MOUSE_DIM:]
-            disc = a[:, :-MOUSE_DIM]
-        else:
-            disc = a
-            mouse = torch.zeros(a.shape[0], 2)
-        return disc, mouse

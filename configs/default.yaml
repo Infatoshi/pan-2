@@ -22,7 +22,7 @@ train:
   device: cuda
   bf16: true
   synthetic: false
-  data_dir: /data/pan-2/episodes
+  data_dir: /data/pan-2/shards
   ckpt_dir: data/checkpoints
   keep_uint8: true
   compile: false
