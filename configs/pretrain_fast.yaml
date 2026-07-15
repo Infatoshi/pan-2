@@ -1,0 +1,28 @@
+# High-throughput pretrain: native 64px, uint8 H2D, SDPA transformer, compile.
+model:
+  image_size: 64
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  context_len: 128
+  action_chunk: 10
+  n_discrete: 23
+  mouse_dim: 2
+  backbone: transformer
+  frame_subsample: 2
+
+train:
+  stage: pretrain
+  batch_size: 64
+  lr: 0.0003
+  max_steps: 10000
+  log_every: 50
+  ckpt_every: 1000
+  num_workers: 4
+  device: cuda
+  bf16: true
+  synthetic: false
+  data_dir: /data/pan-2/episodes
+  ckpt_dir: data/checkpoints
+  keep_uint8: true
+  compile: false

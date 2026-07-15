@@ -1,0 +1,439 @@
+"""Pipelined GPU-resident clip ring for pretrain.
+
+Design
+------
+- Keep a large uint8 clip buffer on GPU (~budget_gb, default 10).
+- Background producers: mp4/npy -> pinned host -> non_blocking H2D into free slot.
+- Training thread only indexes GPU memory (no per-step disk/H2D once warm).
+
+At 64x64, CPU ffmpeg scale is typically faster than NVDEC for short seeks; producers
+still pipeline so decode overlaps with train. Swap producer backend later (DALI/NVDEC)
+without changing the consumer API.
+"""
+
+from __future__ import annotations
+
+import queue
+import random
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+@dataclass
+class PipelineConfig:
+    raw_dir: str = "/data/pan-2/raw"
+    episodes_dir: str = "/data/pan-2/episodes"
+    batch_size: int = 32
+    context_len: int = 128
+    frame_subsample: int = 2  # 20Hz data -> ~10fps effective tokens
+    image_size: int = 64
+    budget_gb: float = 10.0
+    num_producers: int = 8
+    prefer_source: str = "auto"  # auto | mp4 | npy
+    device: str = "cuda"
+    seed: int = 0
+    # goal = frame strictly after the context window, horizon in native frames
+    # (20Hz): defaults 1s..15s into the future
+    min_goal_horizon: int = 20
+    max_goal_horizon: int = 300
+    # recycle a used slot with this probability so producers keep refilling
+    # fresh clips/goals instead of serving a frozen capacity-sized subset
+    refresh_prob: float = 0.05
+    # min fill fraction before yielding batches
+    min_fill: float = 0.05
+    # ffmpeg binary
+    ffmpeg: str = "ffmpeg"
+
+
+def _subsample_indices(t: int, k: int) -> list[int]:
+    k = max(1, k)
+    idxs = list(range(0, t, k))
+    if idxs[-1] != t - 1:
+        idxs.append(t - 1)
+    return idxs
+
+
+class GpuClipRing:
+    """Fixed GPU tensor of shape [capacity, T_sub, 3, H, W] uint8 + readiness flags."""
+
+    def __init__(
+        self,
+        capacity: int,
+        t_sub: int,
+        image_size: int,
+        device: torch.device,
+    ):
+        self.capacity = capacity
+        self.t_sub = t_sub
+        self.image_size = image_size
+        self.device = device
+        self.frames = torch.empty(
+            capacity,
+            t_sub,
+            3,
+            image_size,
+            image_size,
+            dtype=torch.uint8,
+            device=device,
+        )
+        # host-side readiness (bool per slot); producers set under lock after H2D sync
+        self.ready = [False] * capacity
+        self.lock = threading.Lock()
+        self.free_q: queue.Queue[int] = queue.Queue()
+        self.ready_list: list[int] = []
+        for i in range(capacity):
+            self.free_q.put(i)
+        # CUDA streams for concurrent H2D
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(4)]
+        self._stream_i = 0
+
+    def bytes_allocated(self) -> int:
+        return self.frames.numel() * self.frames.element_size()
+
+    def num_ready(self) -> int:
+        with self.lock:
+            return len(self.ready_list)
+
+    def acquire_free(self, timeout: float | None = None) -> int | None:
+        try:
+            return self.free_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def publish(self, slot: int, host_uint8: torch.Tensor) -> None:
+        """H2D host [T,3,H,W] uint8 into slot; mark ready."""
+        stream = self.streams[self._stream_i % len(self.streams)]
+        self._stream_i += 1
+        # order behind default-stream work (index_select reads) since recycled
+        # slots are refilled while training may still be reading them
+        stream.wait_stream(torch.cuda.default_stream(device=self.device))
+        with torch.cuda.stream(stream):
+            self.frames[slot].copy_(host_uint8, non_blocking=True)
+        stream.synchronize()
+        with self.lock:
+            if not self.ready[slot]:
+                self.ready[slot] = True
+                self.ready_list.append(slot)
+
+    def recycle(self, slot: int) -> None:
+        """Optional: free a slot for refill (LRU eviction)."""
+        with self.lock:
+            if self.ready[slot]:
+                self.ready[slot] = False
+                if slot in self.ready_list:
+                    self.ready_list.remove(slot)
+        self.free_q.put(slot)
+
+    def sample_slots(self, n: int, rng: random.Random) -> list[int]:
+        with self.lock:
+            if len(self.ready_list) < n:
+                return []
+            return rng.sample(self.ready_list, n)
+
+
+def _decode_mp4_window(
+    mp4: Path,
+    start_frame: int,
+    num_frames: int,
+    image_size: int,
+    ffmpeg: str = "ffmpeg",
+) -> np.ndarray:
+    """Decode a contiguous window to uint8 NHWC RGB via ffmpeg (scale to image_size).
+
+    Uses stream copy positioning via -ss after -i for accuracy; for speed, -ss before -i.
+    """
+    # approx timestamp at 20fps (VPT contractor)
+    fps = 20.0
+    ss = max(0.0, start_frame / fps)
+    cmd = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-ss",
+        f"{ss:.3f}",
+        "-i",
+        str(mp4),
+        "-frames:v",
+        str(num_frames),
+        "-vf",
+        f"scale={image_size}:{image_size}",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    need = num_frames * image_size * image_size * 3
+    if proc.returncode != 0 or len(proc.stdout) < need:
+        raise RuntimeError(
+            f"ffmpeg failed {mp4.name} rc={proc.returncode} "
+            f"got={len(proc.stdout)} need={need} err={proc.stderr[-200:]!r}"
+        )
+    arr = np.frombuffer(proc.stdout[:need], dtype=np.uint8)
+    return arr.reshape(num_frames, image_size, image_size, 3)
+
+
+def _load_npy_window(
+    img_path: Path,
+    start: int,
+    num_frames: int,
+    image_size: int,
+) -> np.ndarray:
+    frames = np.load(img_path, mmap_mode="r")
+    window = np.ascontiguousarray(frames[start : start + num_frames])
+    # window: T,H,W,C — resize on CPU if needed (episodes are already 64)
+    if window.shape[1] != image_size or window.shape[2] != image_size:
+        # simple nearest via torch
+        t = torch.from_numpy(window).permute(0, 3, 1, 2).float()
+        t = torch.nn.functional.interpolate(
+            t, size=(image_size, image_size), mode="bilinear", align_corners=False
+        )
+        window = t.to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
+    return window
+
+
+class _Producer(threading.Thread):
+    def __init__(
+        self,
+        ring: GpuClipRing,
+        items: list[dict],
+        cfg: PipelineConfig,
+        stop_evt: threading.Event,
+        stats: dict,
+        lock: threading.Lock,
+    ):
+        super().__init__(daemon=True)
+        self.ring = ring
+        self.items = items
+        self.cfg = cfg
+        self.stop_evt = stop_evt
+        self.stats = stats
+        self.lock = lock
+        self.rng = random.Random(cfg.seed + id(self) % 10000)
+
+    def run(self) -> None:
+        t_full = self.cfg.context_len
+        k = self.cfg.frame_subsample
+        idxs = _subsample_indices(t_full, k)
+        # slot layout: [0:t_sub] context tokens, then future-goal, then hard neg
+        assert len(idxs) + 2 == self.ring.t_sub
+
+        while not self.stop_evt.is_set():
+            slot = self.ring.acquire_free(timeout=0.2)
+            if slot is None:
+                # ring full — brief sleep
+                time.sleep(0.01)
+                continue
+            item = self.rng.choice(self.items)
+            try:
+                host = self._make_clip(item, idxs)
+                # host: [t_sub+1, 3, H, W] uint8 torch pinned
+                self.ring.publish(slot, host)
+                with self.lock:
+                    self.stats["fills"] += 1
+            except Exception as e:
+                # return slot and continue
+                self.ring.free_q.put(slot)
+                with self.lock:
+                    self.stats["errors"] += 1
+                    self.stats["last_error"] = repr(e)
+
+    def _make_clip(self, item: dict, idxs: list[int]) -> torch.Tensor:
+        t_full = self.cfg.context_len
+        t_load = t_full + 2 * self.cfg.max_goal_horizon  # room for goal + hard neg
+        src = item["source"]
+        if src == "npy":
+            img_path = Path(item["img"])
+            frames = np.load(img_path, mmap_mode="r")
+            t = int(frames.shape[0])
+            if t < t_load:
+                raise RuntimeError(f"short npy {img_path.name} T={t}")
+            start = self.rng.randint(0, t - t_load)
+            window = np.ascontiguousarray(frames[start : start + t_load])  # T,H,W,C
+        else:
+            mp4 = Path(item["mp4"])
+            # sample start; unknown length — use act/jsonl length if present else 0..large
+            max_start = int(item.get("max_start", 5000))
+            start = self.rng.randint(0, max(0, max_start))
+            window = _decode_mp4_window(
+                mp4,
+                start_frame=start,
+                num_frames=t_load,
+                image_size=self.cfg.image_size,
+                ffmpeg=self.cfg.ffmpeg,
+            )
+        horizon = self.rng.randint(self.cfg.min_goal_horizon, self.cfg.max_goal_horizon)
+        goal = window[t_full - 1 + horizon]  # strictly after context end
+        # hard negative: same episode, strictly beyond the goal window
+        neg_off = self.rng.randint(1, self.cfg.max_goal_horizon)
+        neg = window[t_full - 1 + self.cfg.max_goal_horizon + neg_off]
+        # NHWC -> NCHW uint8 pinned; layout [ctx toks | goal | neg]
+        thwc = torch.from_numpy(np.ascontiguousarray(window[idxs]))  # T,H,W,C
+        nchw = thwc.permute(0, 3, 1, 2).contiguous()
+        goal_t = torch.from_numpy(goal.transpose(2, 0, 1).copy())
+        neg_t = torch.from_numpy(neg.transpose(2, 0, 1).copy())
+        return torch.cat([nchw, goal_t.unsqueeze(0), neg_t.unsqueeze(0)]).pin_memory()
+
+
+class PipelinedGpuPretrainLoader:
+    """Iterable of pretrain batches {frames, goal} already on GPU (uint8)."""
+
+    def __init__(self, cfg: PipelineConfig):
+        if not torch.cuda.is_available():
+            raise RuntimeError("PipelinedGpuPretrainLoader requires CUDA")
+        self.cfg = cfg
+        self.device = torch.device(cfg.device)
+        self.rng = random.Random(cfg.seed)
+
+        self.items = self._discover_items()
+        if not self.items:
+            raise FileNotFoundError(
+                f"no clips under raw={cfg.raw_dir} episodes={cfg.episodes_dir}"
+            )
+
+        idxs = _subsample_indices(cfg.context_len, cfg.frame_subsample)
+        t_slot = len(idxs) + 2  # +1 future-goal frame, +1 hard-negative frame
+        bytes_per_clip = t_slot * 3 * cfg.image_size * cfg.image_size  # uint8
+        capacity = max(64, int(cfg.budget_gb * (1024**3) // bytes_per_clip))
+        # leave headroom if device has less free memory
+        free, _total = torch.cuda.mem_get_info(self.device)
+        max_by_free = int((free * 0.85) // bytes_per_clip)
+        capacity = max(32, min(capacity, max_by_free))
+
+        self.ring = GpuClipRing(capacity, t_slot, cfg.image_size, self.device)
+        self.stats = {"fills": 0, "errors": 0, "last_error": "", "batches": 0}
+        self._stats_lock = threading.Lock()
+        self._stop = threading.Event()
+        self.producers = [
+            _Producer(self.ring, self.items, cfg, self._stop, self.stats, self._stats_lock)
+            for _ in range(cfg.num_producers)
+        ]
+        for p in self.producers:
+            p.start()
+
+        self._wait_for_fill()
+
+    def _discover_items(self) -> list[dict]:
+        raw = Path(self.cfg.raw_dir)
+        eps = Path(self.cfg.episodes_dir)
+        prefer = self.cfg.prefer_source
+        items: list[dict] = []
+
+        mp4s = {p.stem: p for p in raw.glob("*.mp4")} if raw.is_dir() else {}
+        imgs = {}
+        if eps.is_dir():
+            imgs = {p.name.replace(".img.npy", ""): p for p in eps.glob("*.img.npy")}
+        stems = sorted(set(mp4s) | set(imgs))
+
+        for stem in stems:
+            has_npy = stem in imgs
+            has_mp4 = stem in mp4s
+            if prefer == "npy" and has_npy:
+                source = "npy"
+            elif prefer == "mp4" and has_mp4:
+                source = "mp4"
+            elif prefer == "auto":
+                # npy is much cheaper fill; use it when present, else mp4
+                source = "npy" if has_npy else ("mp4" if has_mp4 else "")
+            else:
+                source = "mp4" if has_mp4 else ("npy" if has_npy else "")
+            if not source:
+                continue
+            rec: dict = {"stem": stem, "source": source}
+            if source == "npy":
+                rec["img"] = str(imgs[stem])
+                try:
+                    arr = np.load(imgs[stem], mmap_mode="r")
+                    tlen = int(arr.shape[0])
+                    t_load = self.cfg.context_len + 2 * self.cfg.max_goal_horizon
+                    if tlen < t_load:
+                        continue
+                    rec["max_start"] = tlen - t_load
+                except Exception:
+                    continue
+            else:
+                rec["mp4"] = str(mp4s[stem])
+                # pair with act npy for length if exists
+                act = eps / f"{stem}.act.npy"
+                if act.exists():
+                    try:
+                        a = np.load(act, mmap_mode="r")
+                        t_load = self.cfg.context_len + 2 * self.cfg.max_goal_horizon
+                        rec["max_start"] = max(0, int(a.shape[0]) - t_load)
+                    except Exception:
+                        rec["max_start"] = 4000
+                else:
+                    rec["max_start"] = 4000
+            items.append(rec)
+        return items
+
+    def _wait_for_fill(self, timeout_s: float = 120.0) -> None:
+        need = max(self.cfg.batch_size * 2, int(self.ring.capacity * self.cfg.min_fill))
+        t0 = time.time()
+        while self.ring.num_ready() < need:
+            if time.time() - t0 > timeout_s:
+                raise TimeoutError(
+                    f"GPU ring fill timeout: ready={self.ring.num_ready()} "
+                    f"need={need} errors={self.stats['errors']} "
+                    f"last={self.stats.get('last_error')}"
+                )
+            time.sleep(0.05)
+        print(
+            f"[gpu_pipeline] ready={self.ring.num_ready()}/{self.ring.capacity} "
+            f"buf={self.ring.bytes_allocated()/1e9:.2f}GB "
+            f"items={len(self.items)} producers={self.cfg.num_producers} "
+            f"fills={self.stats['fills']} errors={self.stats['errors']}"
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        for p in self.producers:
+            p.join(timeout=1.0)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        bs = self.cfg.batch_size
+        # wait until enough ready
+        while True:
+            slots = self.ring.sample_slots(bs, self.rng)
+            if slots:
+                break
+            if self._stop.is_set():
+                raise StopIteration
+            time.sleep(0.005)
+
+        # frames: [B, t_slot, 3, H, W] views via index — clone to contiguous batch
+        # index_select is fine; avoids holding slot forever
+        slot_t = torch.tensor(slots, device=self.device, dtype=torch.long)
+        frames = self.ring.frames.index_select(0, slot_t)  # B,T,C,H,W
+        # slot layout: [ctx toks | goal | neg], goal/neg baked at fill time
+        # (goal 1s..15s after context end; neg past the goal window, same clip)
+        neg = frames[:, -1]
+        goal = frames[:, -2]
+        ctx = frames[:, :-2]
+
+        # refresh a few used slots so producers keep cycling fresh clips/goals
+        for s in slots:
+            if self.rng.random() < self.cfg.refresh_prob:
+                self.ring.recycle(s)
+
+        with self._stats_lock:
+            self.stats["batches"] += 1
+        return {"frames": ctx, "goal": goal, "neg": neg}
+
+    def status(self) -> dict:
+        return {
+            "ready": self.ring.num_ready(),
+            "capacity": self.ring.capacity,
+            "buf_gb": self.ring.bytes_allocated() / 1e9,
+            **{k: self.stats[k] for k in ("fills", "errors", "batches", "last_error")},
+        }

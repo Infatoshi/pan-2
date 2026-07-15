@@ -1,0 +1,29 @@
+# Post-train overfit sanity (SPEC criterion 2): one real episode, small model.
+# Success = action losses collapse as the model memorizes the episode.
+model:
+  image_size: 64
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  context_len: 64
+  action_chunk: 10
+  n_discrete: 23
+  mouse_dim: 2
+  backbone: transformer
+  frame_subsample: 2
+  stem_channels: 32
+
+train:
+  stage: posttrain
+  batch_size: 16
+  lr: 0.0005
+  max_steps: 500
+  log_every: 25
+  ckpt_every: 1000
+  device: cuda
+  bf16: true
+  synthetic: false
+  data_dir: /data/pan-2/episodes
+  ckpt_dir: data/checkpoints
+  keep_uint8: true
+  max_episodes: 1

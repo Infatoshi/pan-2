@@ -1,0 +1,24 @@
+model:
+  image_size: 64
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  context_len: 16
+  action_chunk: 5
+  n_discrete: 23
+  mouse_dim: 2
+  backbone: transformer
+  frame_subsample: 2
+
+train:
+  stage: posttrain
+  batch_size: 4
+  lr: 0.001
+  max_steps: 10
+  log_every: 1
+  ckpt_every: 100
+  device: cuda
+  bf16: true
+  synthetic: true
+  ckpt_dir: data/checkpoints
+  keep_uint8: true

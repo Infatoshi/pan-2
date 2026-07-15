@@ -1,0 +1,271 @@
+# DEVLOG: pan-2
+
+## 2026-07-15 — project scaffold
+
+- Created anvil-primary repo at `~/dev/pan-2`.
+- Method: Pan-style goal-conditioned pretrain + action post-train; single Blackwell.
+- Existing data on box: `/data/vpt/raw` (~241G), `/data/vpt/episodes` (~95G).
+- Disk free (approx): `/` ~2.1T, `/data` ~1.4T. User handling additional space/data on the side.
+- Kernel SOTA assumed non-blocking; architecture favors cheap frame tokens + chunked actions + swap-friendly temporal backbone.
+- Next: keep synthetic smoke green; wire real VPT loader sanity after deps; scale data when user frees space.
+
+## 2026-07-15 — smoke green
+
+- `uv sync --extra dev` OK (torch 2.13 + cu13).
+- `uv run pytest -q`: 4 passed.
+- `uv run ruff check . --fix`: clean.
+- `CUDA_VISIBLE_DEVICES=0 uv run python scripts/smoke.py`: pretrain+posttrain train steps OK.
+- VPT episode probe: `img.npy` is `(T, 64, 64, 3) uint8`, `act.npy` is `(T, 25) float32`. Loader already resizes to `image_size`; action layout still heuristic (last-2 mouse) and needs a proper VPT action map before real post-train.
+- GPU0 had ~55GB in use at scaffold time; still enough for smoke. Check `nvidia-smi` before larger runs.
+
+
+## 2026-07-15 — VPT data cleaned and moved
+
+- Source `/data/vpt` validated and moved to `/data/pan-2`.
+- Kept 1625 good episodes (8155382 frames, ~113.3h @ 20Hz). Dropped 27 (too_short / empty img).
+- Layout: episodes/, raw/ (good only), meta/, quarantine/.
+- Project symlink: `~/dev/pan-2/data/vpt` -> `/data/pan-2`.
+- Defaults: `data_dir=/data/pan-2/episodes`, `n_discrete=23` (VPT act dim 25 = 23+2 mouse).
+
+## 2026-07-15 — pretrain infra perf (real /data/pan-2/episodes)
+
+Harness: `scripts/bench_pretrain.py`. Default-ish: d_model=512, 8 layers, ~28.5M params, bf16, pretrain contrastive.
+
+### RTX 3090 (GPU1), bs=16, T=128, img=128
+- getitem ~2.1ms (slice cheap; float+resize ~1ms)
+- dataloader alone: nw=0 best ~9.2 batch/s; nw>0 slower (mmap/worker overhead)
+- gpu_compute_only: 276 ms/step
+- h2d: 68 ms, **403 MB/batch** float32 frames
+- full wall: **331 ms/step** (~3.0 step/s, ~6.2k frames/s)
+- phase share: backward 47.6%, forward 33.0%, h2d 17.2%, data_wait 0.1%
+- **BOTTLENECK: GPU compute (backward)**; secondary H2D from float32 pixels
+
+### 3090, bs=16, T=128, img=64 (native)
+- full wall: **108 ms/step** (~9.3 step/s); still GPU-bound (~50% bwd)
+
+### Blackwell GPU0 (contended ~55GB other job), bs=8, T=64, img=64
+- full wall: **16.6 ms/step** (~60 step/s); still GPU-bound (bwd 44%)
+
+Fixes ranked: (1) uint8 H2D + GPU normalize (2) train native 64 or fuse resize on GPU (3) larger microbatch on free Blackwell (4) kernel/backbone later.
+
+
+## 2026-07-15 — pretrain infra opts + rebench
+
+Implemented:
+1. uint8 H2D + GPU normalize (`prepare_images`)
+2. native 64px default (no CPU upsample)
+3. larger batch defaults (32/64) + optional `torch.compile`
+
+Blackwell GPU0 (contended ~55GB other job), real `/data/pan-2/episodes`:
+
+| config | wall ms/step | frames/s | serial cpu/xfer/gpu |
+|--------|-------------:|---------:|---------------------|
+| old-ish float host, bs16, want 128 | 87 | 23k | 1.3 / 4.4 / 94.3 |
+| uint8 native64 bs32 | 49 | 83k | 1.8 / 4.1 / 94.1 |
+| uint8 native64 bs64 | 92 | 89k | 0.3 / 4.8 / 95.0 |
+| uint8 bs64 + compile | 69 | 119k | 2.3 / 5.6 / 92.1 |
+
+Bottleneck remains GPU kernels (~92-95% serial share).
+
+
+## 2026-07-15 — GPU kernel focus (SDPA temporal)
+
+Replaced `nn.TransformerEncoder` with custom pre-norm blocks + `scaled_dot_product_attention(is_causal=True)`.
+Also: TF32, cudnn.benchmark, channels_last CNN, fused AdamW.
+
+### 3090 results (uint8, 64px, T=128, free GPU1)
+
+| stack | wall ms | frames/s | gpu% serial |
+|-------|--------:|---------:|------------:|
+| prior (nn.TransformerEncoder) bs32 | 185 | 22k | 95 |
+| **SDPA bs32** | **86** | **47.5k** | 91 |
+| SDPA+compile bs32 | 129 | 32k | 92 (compile hurt wall) |
+| SDPA+compile bs64 | 157 | 52k | 89 |
+
+Winner for steady train: SDPA without compile at bs32 (~2.15x vs previous optimized path).
+compile: false default; optional for large-batch experiments.
+
+## 2026-07-15 — CNN hotspots fixed + reprofile (3090)
+
+Implemented from profiler plan:
+1. BatchNorm -> GroupNorm
+2. Cheaper encoder (stem 32 + depthwise separable blocks)
+3. Temporal frame_subsample=4 (dataset + model; keep last frame)
+4. Subsample before cast; uint8 H2D only for T/k frames
+
+### 3090 real-data profile (bs32 T128 img64)
+
+| | wall ms | top-1 |
+|--|--------:|-------|
+| before (SDPA + full CNN BN every frame) | 85.8 | conv_bwd 25% |
+| after | **20.0** | copy_ 17% |
+
+Top5 after: copy_ 17%, HtoD 10%, group_norm 8%, conv_bwd 7%, mm 6%.
+~4.3x step speedup.
+
+## 2026-07-15 — GPU pipelined loader (~10GB ring)
+
+Added `pan2.data.gpu_pipeline.PipelinedGpuPretrainLoader`:
+- GPU uint8 ring sized by budget_gb (default 10)
+- async producers: npy (fast) or mp4/ffmpeg (on-the-fly) -> pin -> H2D
+- train path only index_select on GPU (data_only ~0.1ms warm)
+
+3090 bench (bs32, T_sub=33, stem32, GN encoder):
+- auto/npy fill: 8.6GB ring, fill 0.6s to ready, data_only 0.09ms, wall ~31ms/step
+- mp4 fill: works; slower warm (~5s for 2GB); short clips can underrun ffmpeg frames
+- NVDEC scale_cuda not usable on this ffmpeg build; CPU scale@64 is faster for short windows
+
+Train entry: `scripts/train_pretrain_pipeline.py --budget-gb 10`
+
+## 2026-07-15 — correctness pass: goals, action layout, subsample bugs
+
+Triggered by an external review that (correctly) flagged the pipeline as
+optimizing a broken task. Fixes, all measured not guessed:
+
+1. **Goal sampling was copy detection.** Old: goal = last context frame
+   (dataset) or random in-clip frame (gpu_pipeline). Fixed: goal = frame
+   strictly after context end, horizon ~ U(20, 300) native frames (1..15s at
+   20Hz) in both loaders (`min_goal_horizon` / `max_goal_horizon` in
+   TrainConfig/PipelineConfig). gpu_pipeline slots now store t_sub context
+   frames + 1 baked future-goal frame; used slots recycle with p=0.05 so the
+   ring refills fresh clips/goals (before, recycling was never called and the
+   ring served a frozen capacity-sized subset; added producer->default stream
+   ordering to make recycling race-free).
+
+2. **Action layout recovered from data.** act dim 25: cols 0-22 binary,
+   23-24 camera dx/dy quantized to 0.1 steps in [-1, 1] (21 bins). Column to
+   key mapping recovered by correlating act columns with raw jsonl key events
+   (frame-aligned recall/precision over 10 episodes): 0=esc 1=s 3=w 13=e
+   14=space 15=a 16=d 17=lshift 18=lctrl 20=mouse.0 21=mouse.1; 12 columns
+   dead (presumed hotbar). Authoritative table in `pan2/actions.py`.
+
+3. **Double subsampling bug.** VPTEpisodeDataset subsampled windows at k AND
+   PanPolicy subsampled again at k (pipeline path avoided it by forcing model
+   k=1). At k=8 the plain train path encoded 3 tokens per clip. Fixed: dataset
+   returns full-rate windows; the model is the single subsampler (pipeline
+   subsamples at ring fill, model k=1 as before).
+
+4. **frame_subsample default 8 -> 2.** Data is 20Hz; k=2 gives 10fps tokens
+   (Pan rate). k=8 (2.5fps) makes the next-10-action chunk (0.5s) invisible
+   to the model and starves context. All yaml configs pin k=2. T=128, k=2 ->
+   65 tokens/clip.
+
+5. Dataset `__len__` no longer multiplies epochs by 8; synthetic fixtures now
+   use a future-frame goal (plumbing shape matches the real task; synthetic
+   stays unlearnable by construction, it validates shapes not accuracy).
+
+Fixed-task learnability (3090, 27M model, pipelined loader, bs=32, 400 steps,
+real data): contrastive top-1 retrieval 0.40 -> 0.97 vs chance 0.031. Note:
+in-batch negatives are mostly other clips, so this is largely scene matching;
+harder negatives (same-episode, other horizons) are the next task upgrade
+before claiming goal-directed representations.
+
+Perf after fixes (3090 GPU1; GPU0 busy with another job, no contended numbers
+reported). Config: 27M params, T=128, k=2 (65 tok/clip), img64, bf16, bs=32:
+- mmap dataset path (train_pretrain.py): wall 40.1 ms/step, ~102k frames/s,
+  serial share cpu 6.9 / h2d 18.3 / gpu 74.8 (h2d up because windows are now
+  full-rate; pipeline path avoids this)
+- pipelined ring path (train_pretrain_pipeline.py): wall 31.0 ms/step,
+  1032 clips/s, ~67k tokens/s, per-token-throughput within noise of the
+  pre-fix k=8 kernel rates (0.0149 vs 0.0145 ms/clip-token), i.e. the kernel
+  work had converged; what changed is the task being fed is now correct.
+- ring refill verified: fills > capacity, 0 errors, refresh cycling.
+
+Tests: 11 passed incl. new future-goal regression tests; ruff clean (also
+fixed leftover lint debt in profile/sweep scripts).
+
+## 2026-07-15 — re-profile after CNN prune (subsample 8, stem/b1 GN gone)
+
+Opts already landed: `frame_subsample=8` default; stem GN removed; block1 is single stride-2 conv (no GN / no DW+PW); GPU ring pipeline.
+
+**Unit:** `uv run pytest -q` → 9 passed (1.35s).
+
+**GPU:** 3090 free (CUDA_VISIBLE_DEVICES=1). GPU0 Blackwell busy ~57GB / 100%.
+
+### Module conv/GN (`profile_conv_gn_bwd.py`, B=256, budget 3GB ring, model subsample=1)
+
+- wall avg **67.4 ms** (p50 63.5)
+- tracked modules: stem.conv, b1_conv, b2_dw/pw/gn, b3_dw/pw/gn (no stem.gn, no b1 gn/dw)
+
+| aggregate | ms | % wall |
+|-----------|---:|-------:|
+| all_conv_fwd | 7.3 | 10.8% |
+| all_gn_fwd | 2.4 | 3.5% |
+| all_conv_bwd | 11.3 | 16.8% |
+| all_gn_bwd | 3.9 | 5.8% |
+| **conv_bwd+gn_bwd** | **15.3** | **22.6%** |
+
+Stage bwd rollup:
+- stem: 0.0% wall (hook; stem input no grad — stem still shows in aten conv_bwd shapes)
+- block1: **4.9 ms / 7.3%** (b1_conv only)
+- block2: 4.7 ms / 7.0% (conv 3.3 + gn 1.4)
+- block3: 5.6 ms / 8.3% (conv 3.1 + gn 2.5)
+
+Per-module bwd leaders: b1_conv 7.3%, b2_dw 3.9%, b3_gn 3.7%, b3_dw 3.3%, b2_gn 2.1%.
+
+### Pipeline full step (`bench_gpu_pipeline.py`, B=256, T=128→17 uint8, subsample 8 on ring)
+
+- full_step_wall **68.8 ms** (~14.5 step/s)
+- gpu_compute_only 62.5 ms; data_only 0.74 ms; stall 6.4 ms (9% wall)
+- frames shape `(256, 17, 3, 64, 64)` uint8
+
+### Train-step top kernels (`profile_train_step.py` on-device, B=256, model subsample=8)
+
+- wall avg **64.2 ms** (p50 64.2)
+
+Top 5 (self device, % of wall):
+1. `aten::convolution_backward` — 18.0 ms, **28.0%**
+2. `aten::mm` — 9.5 ms, **14.8%**
+3. cutlass_gemm_or_fprop — 7.5 ms, **11.7%**
+4. group_norm_kernel — 7.3 ms, **11.3%** (remaining b2+b3 GN only)
+5. gelu_backward_kernel — 6.5 ms, **10.1%**
+
+### vs previous baseline (this session, pre-prune round)
+
+| metric | before | now |
+|--------|-------:|----:|
+| wall @ B=256 | ~61 ms | **64–69 ms** (on-device 64 / module 67 / pipeline 69) |
+| conv_bwd+gn_bwd % wall | ~38% | **22.6%** (module hooks) |
+| stem.gn | ~8% | **gone** |
+| b1_dw | ~7.5% | **gone** (replaced by b1_conv ~7.3% bwd) |
+
+**Read:** GN surface area cut worked (stem+b1 GN out; aggregate conv+GN bwd share 38%→23%). Wall did **not** improve and may be slightly worse — block1 full 3×3 s2 conv (~7% bwd) is a similar-cost replacement for the old DW path, and remaining hot spots are stem/b1 dense conv_bwd, transformer mm/GEMM, and residual b2/b3 GN. Next leverage is likely attention/MLP (mm + gelu_bwd ~25% combined) or cheaper stem/b1 spatial path, not more GN deletion alone.
+
+## 2026-07-15 — same-episode hard negatives (task hardening)
+
+Loaders now also return `neg`: a frame from the SAME episode strictly past
+the goal window (neg_idx = context_end + max_horizon + 1..max_horizon).
+Extra column in `GoalValueHead.logits` (own-row hard negative) aimed at
+killing the scene-ID shortcut left by cross-episode in-batch negatives.
+Ring slots are now [ctx toks | goal | neg]; `train.hard_negatives` toggles.
+
+400-step rerun (3090, pipelined, bs=32, real data, fixed task + hard neg):
+- acc(last-50): 0.33 -> 0.95 by step 400 (chance 0.030); without hard neg the
+  same run hit 0.97. Harder, learnable, still not saturated-hard; candidate
+  next step: negatives from INSIDE the goal window at wrong horizons.
+- wall: 36.6 ms/step vs 31.0 without hard neg (extra frame encode per row).
+
+## 2026-07-15 — open-source restructure
+
+- Public packaging: pyproject 0.2.0 (MIT, classifiers, urls), LICENSE added.
+- `pan2/kernels/` created as the custom-op home: registry + contract
+  (ref impl + optimized impl + unit test + bench per op, claims cite benches).
+- README rewritten as public intro (method, data contract, quickstart, layout,
+  pitfalls). CLAUDE.md/AGENTS.md harmonized on the new layout. SPEC gains the
+  kernel contract + hard-negative objective spec.
+- Gates at restructure: pytest 12 passed, ruff clean, smoke green.
+
+## 2026-07-15 — posttrain overfit sanity (SPEC criterion 2) + epoch bug
+
+`configs/posttrain_overfit.yaml`: 1 real episode, d256/4L, T=64, k=2, bs=16,
+500 steps (3090). discrete_bce 0.185 -> 0.046, mouse_mse ~0.037 -> ~0.03-0.04
+(noisy), total loss 0.31 -> 0.09. Action path fits real measured-layout
+labels; note ~12/23 button columns are dead so early BCE is easy to deflate.
+
+Bug found: removing the `len(pairs) * 8` epoch multiplier broke tiny
+datasets: max_episodes=1 gave len(ds)=1 < bs=16 with drop_last=True, so the
+DataLoader produced zero batches per epoch and infinite_loader churned
+worker fork/join forever (diagnosed via py-spy: stuck in _shutdown_workers).
+Fix: explicit `windows_per_episode` knob (default 64), documented as the
+epoch definition. Also: always run training scripts with `python -u` (or
+accept pipe-buffered logs).
