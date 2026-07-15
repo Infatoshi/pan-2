@@ -269,3 +269,20 @@ worker fork/join forever (diagnosed via py-spy: stuck in _shutdown_workers).
 Fix: explicit `windows_per_episode` knob (default 64), documented as the
 epoch definition. Also: always run training scripts with `python -u` (or
 accept pipe-buffered logs).
+
+## 2026-07-15 — intent recovered: this is a Pan-1 single-GPU repro
+
+The Grok session's first prompt surfaced: repro pantograph.com/journal/pan-1
+on one GPU. Read the journal (verified 2026-07-15). Key facts vs our repo:
+- Pan-1: 128x128 @ 10FPS, 300-frame context, 20Hz actions, 9 keys + 2 mouse.
+  Pretrain: hindsight in-context value fn + NEXT-FRAME DISTRIBUTION head.
+  Data: 500k h video + 2k h contractor. Eval: 104-env grader suite, 30s cap.
+- Our v0 goal mechanism (strictly future) matches their V(s,g) definition;
+  what we lack is (a) the second (next-frame) objective, (b) cross-policy
+  goal/context pairs (their corpus is arbitrary gameplay, ours is
+  self-centred), (c) ~4 orders of magnitude of video data and most of the
+  demo data, (d) any env.
+- Verdict: kernel/microbench rounds (incl. this week's) optimized the least
+  binding constraint. SPEC gains "Stage A v1: Pan-1 alignment" + a data
+  acquisition section with ordering. README now states the repro mission and
+  the honest gap table. Model work ahead of the data gap is premature.

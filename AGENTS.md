@@ -6,9 +6,13 @@ Train/eval on anvil GPU0 (RTX PRO 6000 Blackwell sm_120) when free, GPU1
 (3090) otherwise. Mac is control plane only.
 
 ## What
-Two stages on a single GPU: action-free goal pretrain on video (strictly
-future-frame goals, InfoNCE + same-episode hard negatives), then action
-post-train on VPT-style labeled episodes with a chunked action head.
+Single-GPU reproduction of Pantograph's Pan-1 (journal:
+pantograph.com/journal/pan-1, alignment notes in SPEC.md). Two stages:
+action-free goal pretrain on video (strictly future-frame goals, InfoNCE +
+same-episode hard negatives), then action post-train on VPT-style labeled
+episodes with a chunked action head. The binding constraint vs Pan-1 is DATA
+(113h vs their 500k h video / 2k h demos); prioritize data acquisition over
+model churn.
 
 ## Docs
 - Method/architecture contract: `SPEC.md`

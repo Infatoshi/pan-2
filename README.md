@@ -1,6 +1,7 @@
 # pan-2
 
-Goal-conditioned Minecraft agent, single-GPU first. Two stages:
+Single-GPU reproduction of Pantograph's Pan-1 method
+(https://pantograph.com/journal/pan-1) for goal-conditioned Minecraft agents. Two stages:
 
 1. **Stage A: action-free goal pretrain.** A causal transformer over CNN frame
    tokens learns, from observation-only video, to match a context window to a
@@ -15,6 +16,12 @@ Stage C (online hindsight relabeling from rollouts) is planned, not required.
 
 Status: alpha research code. The pretrain/posttrain loops, data pipeline, and
 overfit sanity checks run; there is no Minecraft env integration yet.
+
+Honest gap to Pan-1 (verified against the journal): Pan-1 used ~500k h of
+action-free video, ~2k h of contractor trajectories, and a 104-env grader
+suite. This repo currently has 113 h / 113 h / 0 envs and a much smaller
+model. Closing the data gap is the active work; the training machinery here
+is the vehicle, not the result.
 
 ## Why it exists
 
@@ -119,10 +126,11 @@ shapes. Speed claims cite bench output. Full contract:
 
 ## References
 
+- Pan-1 journal (the method this repo reproduces):
+  https://pantograph.com/journal/pan-1
 - VPT: Video PreTraining (Baker et al., 2022), data format + Minecraft BC stack
 - HER (Andrychowicz et al., 2017) and contrastive GCRL for hindsight goals
 - ACT / BAKU for action chunking
-- Inspired by the Pan line of goal-conditioned Minecraft agents
 
 ## License
 
