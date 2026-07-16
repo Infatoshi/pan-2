@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import random
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -25,6 +27,13 @@ class TrainState:
 
 def build_state(cfg: Config) -> TrainState:
     configure_cuda_fast_math()
+    # seed everything so A/B runs over different data variants share init+order
+    seed = cfg.train.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     model: torch.nn.Module = PanPolicy(cfg.model).to(device)
     raw_model = model if isinstance(model, PanPolicy) else None

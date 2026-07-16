@@ -312,3 +312,33 @@ Built the packed shard pipeline and populated /data/pan-2/shards.
 Note: this is repackaging, NOT acquisition. The 500k h video gap stands.
 The build script's --source raw branch recodes from the 640x360 mp4s and is
 the funnel for new scraped video (also enables a true 128px build).
+
+## 2026-07-15 — codec ablation: 500k h fits on one drive; x265 beats NVENC per bit
+
+Re-encoded the full 113 h corpus to training view (128x128 @ 10fps,
+GOP=20) across 6 variants and measured PSNR/SSIM vs the clean
+downscale+decimate reference (24-episode sample,
+`scripts/measure_codec_quality.py`).
+
+- x265 medium: crf23 52 kbps 43.3 dB | crf28 29 kbps 40.2 dB |
+  crf33 16 kbps 37.4 dB. Corpus totals: 6.5 TB per 500k h at crf28.
+- hevc_nvenc (p7/tune-hq, 128 content padded to 144x144 because neither
+  h264 nor hevc NVENC accepts 128x128 on the 3090): cq20 81 kbps 45.1 dB |
+  cq26 44 kbps 41.9 dB | cq32 23 kbps 38.6 dB. Roughly 5-10x faster per
+  stream than x265.
+- Verdict: x265 medium is ~1.5 dB better than NVENC p7 across the curve
+  (~35-40% bitrate saved at equal quality; NVENC's pad pixels are a small
+  systematic against it). NVENC cq26 (42 dB, ~10 TB per 500k h) is the
+  fast-ingest recipe when crawl throughput dominates.
+
+Bug caught by the quality check (bitrate-invisible): `-r 10` as an output
+option corrupted decimation on these files (dupped frames, half-frame
+drift, 25.9 dB vs reference at identical size). `fps=10` as a filter is
+frame-accurate (38.9 dB control). Rule now: decimate with the fps filter,
+never -r, and frame-verify any new encoder path against a counted
+reference before bulk runs. The first x265 sweep (which used -r) was
+wiped and rebuilt.
+
+Also: build_state now actually applies train.seed (was a dead knob);
+train_pretrain_pipeline.py takes --raw-dir/--episodes-dir so A/B/C runs
+over codec variants share seed and differ only in data.

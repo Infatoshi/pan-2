@@ -20,6 +20,8 @@ def main() -> None:
     p.add_argument("--budget-gb", type=float, default=10.0)
     p.add_argument("--producers", type=int, default=8)
     p.add_argument("--prefer-source", default="auto", choices=["auto", "shard", "npy", "mp4"])
+    p.add_argument("--raw-dir", default="/data/pan-2/raw")
+    p.add_argument("--episodes-dir", default="/data/pan-2/episodes")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -31,8 +33,8 @@ def main() -> None:
     cfg.model.frame_subsample = data_sub  # restore for pipeline config below
 
     pcfg = PipelineConfig(
-        raw_dir="/data/pan-2/raw",
-        episodes_dir="/data/pan-2/episodes",
+        raw_dir=args.raw_dir,
+        episodes_dir=args.episodes_dir,
         batch_size=cfg.train.batch_size,
         context_len=cfg.model.context_len,
         frame_subsample=data_sub,
@@ -44,9 +46,6 @@ def main() -> None:
         min_goal_horizon=cfg.train.min_goal_horizon,
         max_goal_horizon=cfg.train.max_goal_horizon,
     )
-    # data_dir might be /data/pan-2/episodes already
-    if Path("/data/pan-2/episodes").is_dir():
-        pcfg.episodes_dir = "/data/pan-2/episodes"
     loader = PipelinedGpuPretrainLoader(pcfg)
 
     def gen():
