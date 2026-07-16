@@ -373,3 +373,22 @@ Kernel opportunities, in order: (a) kill the 8% layout churn
 GN+bias+act in the encoder (another ~6%), (c) elementwise/act fusion in
 the transformer blocks. Encoder conv stack fwd+bwd is ~25% but healthy
 gemms after layout; transformer middle is memory-bound at T=65.
+
+## 2026-07-15 — dataloader headroom: measured ceilings (it is not the bottleneck)
+
+Question posed: "dataloader should NOT be the bottleneck." Measured rather
+than assumed (GPU0, shard source, steady state):
+
+- Per-step data cost on the ring path: 0.10 ms/fetch against a 30.9 ms
+  (3090) / 10.9 ms (Blackwell) step = ~0%. Both GPUs sit at 100%
+  GPU-bound walls.
+- Producer fill rate: 689 clips/s aggregate at 8 producers, 644 at 16 —
+  the limit is per-clip CPU cost (mmap read + pin + H2D), not threads.
+- At Blackwell consumption pace (91.5 steps/s * bs 32 = 2930 clips/s
+  equivalent), refresh_prob must stay <= ~0.235 sustained; the default
+  0.05 carries ~5x headroom. The DataLoader (non-ring) path keeps its
+  20% H2D share; that path is for benches/unit runs, not throughput.
+- Added loader.status()["ready_low"]: low-watermark of resident clips
+  between samples. If it ever trends toward 0, data is becoming the
+  bottleneck; the ceiling math to respond is in gpu_pipeline.py's
+  refresh_prob notes.

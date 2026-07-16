@@ -46,7 +46,12 @@ class PipelineConfig:
     min_goal_horizon: int = 20
     max_goal_horizon: int = 300
     # recycle a used slot with this probability so producers keep refilling
-    # fresh clips/goals instead of serving a frozen capacity-sized subset
+    # fresh clips/goals instead of serving a frozen capacity-sized subset.
+    # Measured 2026-07-15 (shard source, 9950X3D): producers sustain ~690
+    # clips/s aggregate at 8 producers (no gain at 16: per-clip CPU cost,
+    # not thread count, is the limit). At Blackwell consumption (~2930
+    # clips/s equivalent at 91.5 steps/s * bs 32) refresh must stay <= ~0.23
+    # steady state; the default 0.05 has ~5x headroom.
     refresh_prob: float = 0.05
     # min fill fraction before yielding batches
     min_fill: float = 0.05
@@ -323,7 +328,8 @@ class PipelinedGpuPretrainLoader:
         capacity = max(32, min(capacity, max_by_free))
 
         self.ring = GpuClipRing(capacity, t_slot, cfg.image_size, self.device)
-        self.stats = {"fills": 0, "errors": 0, "last_error": "", "batches": 0}
+        self.stats = {"fills": 0, "errors": 0, "last_error": "", "batches": 0,
+                      "ready_low": capacity}
         self._stats_lock = threading.Lock()
         self._stop = threading.Event()
         self.producers = [
@@ -463,6 +469,11 @@ class PipelinedGpuPretrainLoader:
             if self._stop.is_set():
                 raise StopIteration
             time.sleep(0.005)
+        with self._stats_lock:
+            # starvation observability: lowest ready count observed between
+            # successful samples; if this trends toward 0 the pipeline is
+            # becoming the bottleneck (see refresh_prob ceiling notes)
+            self.stats["ready_low"] = min(self.stats["ready_low"], self.ring.num_ready())
 
         # frames: [B, t_slot, 3, H, W] views via index — clone to contiguous batch
         # index_select is fine; avoids holding slot forever
@@ -488,5 +499,5 @@ class PipelinedGpuPretrainLoader:
             "ready": self.ring.num_ready(),
             "capacity": self.ring.capacity,
             "buf_gb": self.ring.bytes_allocated() / 1e9,
-            **{k: self.stats[k] for k in ("fills", "errors", "batches", "last_error")},
+            **{k: self.stats[k] for k in ("fills", "errors", "batches", "last_error", "ready_low")},
         }
