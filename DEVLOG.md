@@ -457,3 +457,43 @@ Attack order from here: (a) heads GELU+copies fusion (~9% worst-case),
 lever is algo/autotune, not layout, (c) gemm efficiency — cublas is
 serving sm80 cutlass binaries on sm_120; a torch build with sm120
 cublas kernels may move the 22% bucket without code changes.
+
+## 2026-07-15 — NCU on sm_120: where the step time actually goes
+
+Isolated per-op harness (scripts/ncu_hot_kernels.py, production shapes
+N=2080 encoder / 2144 temporal rows, bf16, channels_last, cudnn
+benchmark on) + NCU SpeedOfLight/ComputeWorkloadAnalysis/Occupancy per
+kernel class on GPU0 (sm_120), GPU1 (sm_86) as native-binary control.
+12 parallel-safe processes (one per op per GPU; NCU serializes per GPU
+internally). Empirical BF16 roof from giant cublas gemms: ~400 TF/s
+(GPU0), ~71-75 TF/s (3090, matches spec).
+
+Findings, in attack order:
+
+1. cudnn channel-padding churn, ~1.3+ ms/step (~19% of GPU0 step).
+   In-step nhwcAddPaddingKernel runs 6x/step at ~0.21 ms each. Root
+   cause found via isolated conv_stem: the stem conv (Cin=3) is padded
+   to 128 channels (template int 128) so cudnn can run an aligned NHWC
+   engine - ~43x data amplification. Captured window: 7x AddPadding
+   (1744us total) vs 1x actual convolve (1.4us, SOLc 78%). The conv
+   itself is fine; the padding around it is the step. 3090 shows the
+   same disease (tensorTransformGeneric 336us + AddPadding 245us).
+   Fix: hand NHWC direct conv for Cin=3/32 (stem+b1 fusion), no pad.
+2. Transformer gemms wave-quantized at ~50% SOL (bucket = 22% of
+   step). cutlass_80 sm80 binaries on sm_120: SOL compute 52/52/42/31%
+   on fc1/fc2/qkv/proj, achieved occupancy 8-11%, grids ~0.7 waves on
+   188 SMs (M=2144 with 128-tiles). Not a per-SM problem as much as a
+   too-few-CTAs problem. Fix: split-k or smaller/persistent tiles (hand
+   gemm), or simply more tokens per device (batch up) - free SOL.
+3. Eager erf-GELU is near memory SOL already (SOLm 89%, occ 88) - the
+   kernel is fine, the WIN is not materializing: 0.66 ms/step of
+   read/write passes that disappear if fused into neighbours (conv
+   epilogue / GN kernel for stem+b1 which never got the kA fusion).
+4. gn_gelu (ours): SOLm 36% at us-scale; healthy enough, revisit later.
+5. AdamW multi_tensor 0.47 ms/step (7.2%): generic foreach kernel; a
+   fused single-pass AdamW for 27M params should halve it. Cheap win,
+   low risk, do after 1-3.
+
+Projected headroom on GPU0: 1+2+3 recover ~2.5-3 ms of the 7.25 ms
+step; floor is then set by convs-proper + gemm-proper at ~4.2-4.7
+ms/step unless batch size rises (which raises gemm waves for free).
