@@ -342,3 +342,34 @@ wiped and rebuilt.
 Also: build_state now actually applies train.seed (was a dead knob);
 train_pretrain_pipeline.py takes --raw-dir/--episodes-dir so A/B/C runs
 over codec variants share seed and differ only in data.
+
+## 2026-07-15 — measured bottleneck map (ring path is 100% GPU-bound)
+
+Config: 27M params, T=128 (k=2, 65 tok/clip), bs=32, bf16, shard data,
+steady state. Method: hard-sync phase timing + torch.profiler CUDA time.
+
+End-to-end (GPU1 3090):
+- DataLoader path: wall 38.2 ms/step = GPU 30.8 (79%) + H2D 7.8 (20%) +
+  CPU 0.2 (0.5%, fully hidden by prefetch).
+- Ring path (production): wall 30.9 ms/step, data-wait 0.1 ms (~0%).
+  fwd 10.0 / bwd 20.7 / optimizer 0.5 ms.
+
+GPU kernel buckets, 3090 (30.7 ms/step profiler total):
+- transformer linear/MLP gemms 25.5%
+- elementwise + activations + copies 21.7%
+- conv backward (incl. depthwise) 19.4%
+- NCHW<->NHWC layout conversion 8.0%
+- GroupNorm fwd+bwd 6.1%
+- conv forward 5.5%
+- AdamW fused 2.9%, other 10.7%
+
+GPU0 (RTX PRO 6000 Blackwell) ring wall: 10.9 ms/step (91.5 steps/s) =
+2.8x the 3090 with identical code/config; memory headroom fits budget_gb
+8 ring (10433 clips). Phased sums exceed wall due to sync-drain; wall is
+the number to quote.
+
+Kernel opportunities, in order: (a) kill the 8% layout churn
+(channels_last end-to-end or Conv weights pre-transposed), (b) fuse
+GN+bias+act in the encoder (another ~6%), (c) elementwise/act fusion in
+the transformer blocks. Encoder conv stack fwd+bwd is ~25% but healthy
+gemms after layout; transformer middle is memory-bound at T=65.
