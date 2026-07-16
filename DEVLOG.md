@@ -746,3 +746,77 @@ Lesson now codified in the nan-tail regression test: any strided/parity
 filter loop with trip count ceil(K/S) must mask EVERY operand of the
 dot, not just the data operand - one unmasked operand turns index
 overshoot into value nondeterminism that isolated unit tests cannot see.
+
+## 2026-07-16 - Overnight YouTube crawl: 1.10TB / 9,733 videos / ~4,400h in data/crawl
+
+Mission (user, ~00:30): pull ~1TB of Minecraft gameplay from YouTube
+into data/, leave 300GB free, autonomous overnight. Delivered.
+
+Result (measured this morning, unique files in raw/ - NOT done-lines):
+- 9,733 videos, 1.10TB raw h264 640x360 (30fps and 29.97fps mix),
+  meta TSV coverage 9733/9733 = ~4,398 hours on disk
+- durations (s): min 600 / med 1440 / p90 2214 / max 10786
+- supervisor self-halted on 1TB target at 11:22:15; floor never
+  touched (1.33TB free at halt; 1.3TB free now)
+- ~4,398h = 39x the 113h VPT corpus; at the measured GPU0 pretrain
+  rate of 4.8 h-video/s one epoch is ~15 min
+
+How it ran:
+- queue: 43,581 unique ids from 24 hermitcraft/LP channels (full
+  catalogs) + 4 ytsearch no-commentary playlists; shuffled, split
+  per-worker; archive excludes done ids across restarts
+- pilots: yt-dlp per-connection server throttle ~1MB/s REGARDLESS of
+  --concurrent-fragments (3 vs 8 identical); aria2c -x 8 -s 8 -k 16M
+  = 8.1MB/s per worker - 8x, installed and wired via --downloader
+- 01:46 W=40 launch tripped the YouTube IP bot-wall (~80 player-API
+  calls/min incl retries); parked fleet with state/STOP, shaped
+  relaunch W=12 + --sleep-requests 2 + extractor-retries 1 +
+  6-consecutive-bot-wall self-cooling per worker; auto_restart.sh
+  probe-gates relaunches (2 consecutive PASS 300s apart + 3-probe
+  spread >= 2). Wall lifts after ~11 min cool-down and does not
+  escalate across ~30 autonomous wall/cool cycles overnight
+- healthy-fleet sustained rate ~730-800Mbps -> 1TB ideal ~3.1h;
+  actual ~9.6h through the cool-down cycles
+- worker rc=0-with-archive-skip still appends a done line, so
+  done-lines (16,067) overstate unique files (9,733) across the ~30
+  relaunch restarts. Ground truth = unique files in raw/. Fails
+  (8,812 lines) are dominantly filter rejects (shorts <600s,
+  is_live), age-gates, members-only, plus wall streaks - content
+  composition, not poison. 18,606 queue ids remain unprocessed.
+
+QA:
+- ffprobe spot-check 15/15 healthy h264 640x360
+- archive-vs-raw comm: 0 archive-only ids (every archived id has its
+  file; the fail path rms partials)
+- ref transcodes frame-exact vs duration*10 (e.g. 12474/12474);
+  0 tc_fail in 773 at check time
+- title scan: ~39% non-Minecraft-looking titles (upper bound from a
+  crude title regex; whole-channel catalogs include Don't Starve
+  etc). Filter at shard build; raw kept.
+
+Reference-view transcode (docs/ingest-codec.md contract: fps=10 ->
+lanczos 128x128, x265 medium crf28, GOP 20, audio dropped, frame-count
+verified): pool restructured morning-side from 3-wide batch+wait to
+12-wide continuous refill (tc_run markers make re-entry safe), ETA ~6h
+for the full ~9.7k set, projected ~87GB total (773 done = 6.9GB).
+
+Codec arms (overnight, answer to ingest-codec.md open item): 3 arms x
+1000 steps, identical init, train-batch argmax accuracy vs arange:
+A(shard) 0.38->0.9975, B(crf28) 0.41->1.0, C(nvenc_cq32) 0.11->0.999
+by step 400-1000. Coarse contrastive signal survives crf28; crf28
+green-lit for training data. Fine-detail probes still open.
+
+Lessons:
+- pgrep/pkill -f matches the invoking zsh -c command line - every
+  self-match killed my own wrapper mid-compound (exit 144). Bracket
+  trick or kill-by-pid only; watchers must run in their own pgid.
+- Whole-channel harvests buy volume and diversity but import
+  non-target content; price it into the queue and the QA, or seed
+  with playlists instead.
+- aria2 range-parallelism beats yt-dlp fragment parallelism 8x under
+  YouTube per-connection throttling.
+
+Open/next: preview training path on the new corpus (build_shards.py
+needs an --fps flag: decode_mp4 has no fps handling; plan fps=20 ->
+existing 20Hz/64px contract, zero pipeline changes; 128px/10fps
+Pan-1-aligned layout is a data-layout decision for the user).

@@ -40,6 +40,9 @@ model churn.
   - `raw/` — matching mp4+jsonl for good stems
   - `meta/` — manifest + cleanup report
 - Local artifacts: `~/dev/pan-2/data/{checkpoints,cache,shards}`
+- YouTube crawl corpus (gitignored, anvil-local): `~/dev/pan-2/data/crawl/`
+  - `raw/` — 9,733 scraped videos, 1.10TB (~4,400h); `ref/` — verified 128px/10fps crf28 reference views
+  - `state/STOP` halts workers, `state/STOP_TC` halts transcode; `bin/` has worker/supervisor/transcode scripts; logs in `logs/`
 
 ## Commands
 ```bash
