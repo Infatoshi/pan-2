@@ -131,6 +131,9 @@ hard negative, action chunk). The GPU ring loader (`prefer_source: shard`,
 default `auto` prefers shards when present) fills clips straight from shard
 mmaps. 64px build: 24 shards, ~8.16M frames, ~113 h.
 
+Codec ingest recipe for raw video (measured RD curves, decimation rules,
+recipes and open training-signal item): `docs/ingest-codec.md`.
+
 Training code reads shards for both stages; the per-episode npy dir stays as
 rebuild source. Full scrape/latent pipeline is data work (user freeing space on the side).
 

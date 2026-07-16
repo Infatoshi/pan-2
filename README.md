@@ -73,7 +73,9 @@ Action layout (25 dims, measured against raw VPT jsonl, see
 data), cols 23-24 camera dx/dy quantized to 0.1 steps in [-1, 1].
 
 Optional raw mp4+jsonl (same stems, sibling dir) enables the ffmpeg producer
-in the GPU pipeline.
+in the GPU pipeline. The measured codec recipe for turning raw video into
+training-view mp4 (x265 crf28 vs NVENC cq26, GOP 20, the fps-decimation rule)
+is in `docs/ingest-codec.md`.
 
 Point `train.data_dir` at your shards dir (config defaults assume
 `/data/pan-2/shards`).
