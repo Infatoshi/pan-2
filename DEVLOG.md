@@ -497,3 +497,43 @@ Findings, in attack order:
 Projected headroom on GPU0: 1+2+3 recover ~2.5-3 ms of the 7.25 ms
 step; floor is then set by convs-proper + gemm-proper at ~4.2-4.7
 ms/step unless batch size rises (which raises gemm waves for free).
+
+## 2026-07-15 - kernel batch 2: fused AdamW + fused gather/scale/cast
+
+Two fronts from the post-merge bucket map landed this round (kC conv
+frontend still in flight at time of writing).
+
+AdamW (kD, delegated, merged a171222). Triton multi-tensor AdamW over a
+pointer table (params keep storage/identity; state_dict schema matches
+torch AdamW fused for round-trip both directions; PAN2_FUSED_ADAMW=0
+opts out). Acceptance re-run by us, not the delegate: 54 passed in the
+kD tree, 67 passed merged; bench_adamw.py on the 3090 reproduces exactly
+(torch fused 1.061 ms, ours 0.999 ms mean over 200 iters; 1.06x; vs
+foreach 2.79x). Roofline honesty note: 27M fp32 params x 7 streams is
+~0.81 ms at the 3090's 936 GB/s, so torch fused was already at the
+floor; the 1.5x target was unphysical and the delegate said so with
+numbers instead of chasing it. E2E wall on the 3090 is flat (21.26 vs
+21.32 ms, noise); the win is one launch/step instead of chunked
+multi_tensor_apply and a place to bolt on future fusions. AdamW bucket
+is done; do not revisit.
+
+Pointwise/copy audit (#25) + gather_cast (merged e0cf613). Attribution
+of the 7.3% aten bucket on GPU0: the ring batch path was the majority
+(index_select gather copy, uint8 reshape copy, uint8->fp32 CL convert,
+in-place mul_, autocast bf16 cast at the stem: ~600 MB of traffic per
+step at production shape), then eager GELU (bucket-internal, kC's
+target), autocast weight casts (bfloat16_copy ~29/step, small), and
+cudagraph static input copies from the compiled temporal (direct_copy
+~24/step, tens of us; attributed, not attacked). Fix: Triton
+gather_cast (slot gather + uint8->fp32 scale -> bf16 channels_last, one
+pass, ~100 MB) + scale_cast sibling for preprocess of goal/neg and
+non-ring uint8 sources; loader now emits bf16 CL batches directly and
+prepare_images no-ops on them. Bit-exact vs refs by construction
+(uint8->fp32 mul, one rounding at out dtype); 13 new tests bitwise.
+Bench (RTX PRO 6000 Blackwell, bench_gather_cast.py): batch chain
+0.2074 -> 0.0181 ms (11.4x), scale_cast 0.0751 -> 0.0193 ms (3.9x).
+Post-merge GPU1 profile (a171222): wall 21.2 -> 20.62 ms/step
+(self-time 20.26); _gather_cast_kernel sits at 0.102 ms/step, exactly
+the 3090 BW roofline (100 MB / 936 GB/s); the convert/mul/index chain
+is gone from the kernel dump. GPU0 e2e delta lands with the kC batch
+profile (GPU0 occupied by the kC delegate at write time).
