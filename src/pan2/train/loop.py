@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -39,8 +40,13 @@ def build_state(cfg: Config) -> TrainState:
     model: torch.nn.Module = PanPolicy(cfg.model).to(device)
     raw_model = model if isinstance(model, PanPolicy) else None
     if cfg.train.compile and device.type == "cuda":
-        # reduce-overhead good for steady train step; fullgraph=False for SDPA flexibility
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)  # type: ignore[assignment]
+        # Whole-model compile. Same mode story as the temporal stack (see
+        # models/temporal.py): keep "default" in production - cudagraph trees
+        # ("reduce-overhead") are a live NaN landmine with conv_gelu +
+        # FusedAdamW in the process (CLAUDE.md). fullgraph=False splits around
+        # the custom autograd Functions instead of erroring.
+        mode = os.environ.get("PAN2_MODEL_COMPILE_MODE", "default")
+        model = torch.compile(model, mode=mode, fullgraph=False)  # type: ignore[assignment]
     # PAN2_FUSED_ADAMW=1 (default): multi-tensor Triton AdamW on CUDA;
     # =0: stock torch.optim.AdamW (fused=True on CUDA).
     optim = build_adamw(
@@ -94,6 +100,13 @@ def train_steps(
             else:
                 raise ValueError(cfg.train.stage)
         loss.backward()
+        if not torch.isfinite(loss):
+            # hard stop: a nan/inf loss must kill the run, not get silently
+            # absorbed into weights (2026-07-15: a flaky kernel nan trained
+            # on for steps before anyone would notice via logs)
+            raise RuntimeError(
+                f"non-finite loss at step {state.step + 1} (stage={cfg.train.stage})"
+            )
         if cfg.train.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(state.model.parameters(), cfg.train.grad_clip)
         state.optim.step()

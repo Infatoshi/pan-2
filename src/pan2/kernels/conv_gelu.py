@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -393,11 +395,25 @@ def _supported_shape(
     }
 
 
+def _env_triton_enabled() -> bool:
+    # PAN2_CONV_GELU_TRITON=0 (default after the 2026-07-15 real-data flake):
+    # the generic dgrad kernel emits nan dx from finite inputs at ~1% of calls
+    # in real training loops (isolated unit tests pass; nan at training step
+    # 3-13, instrumented call #112, block1 cin=32, inputs verified finite).
+    # Opt back in with =1 only after a rewrite passes 5x 60-step real-data
+    # runs with train_steps' finite-loss gate. Details in DEVLOG 2026-07-15.
+    raw = os.environ.get("PAN2_CONV_GELU_TRITON")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("0", "false", "off", "no")
+
+
 def _can_use_triton(
     x: torch.Tensor, weight: torch.Tensor, stride: int, padding: int
 ) -> bool:
     return bool(
-        _HAS_TRITON
+        _env_triton_enabled()
+        and _HAS_TRITON
         and x.is_cuda
         and weight.is_cuda
         and x.dtype == torch.bfloat16

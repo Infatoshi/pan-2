@@ -645,3 +645,51 @@ whole-model compile at mode=default for the 1.71 ms host-side residual
 do not flip that on as-is), the bs=64 sample-efficiency question with
 the user, then data-pipeline work dominates per the SPEC (DATA is the
 binding constraint, not kernels).
+
+## 2026-07-15 - the NaN is a conv_gelu dgrad flake; kC Triton path default-off
+
+The story collapsed and re-formed twice today; this is the final form.
+A real-data finite check - which no gate ran before, benchmarks never
+checked losses - showed the production stack NaNing real pretrain
+training at step 3-13 on GPU0 with healthy grad norms right up to the
+flip (bs32 and bs64 alike, single model, no eval). Bisect on the
+real-data oracle: PAN2_FUSED_ADAMW=0 nan 3/3, temporal compile off
+nan, gather family off nan, bias family off nan, conv_gelu off = 60
+steps finite. conv_gelu's Triton path alone is necessary and
+sufficient; every earlier "triad" result from the synthetic smoke
+hunts was allocator-layout flips perturbing a probabilistic bug
+(synthetic smoke sees ~15 dgrad calls, p(nan per smoke) only ~14%, so
+"clean 3/3" was always weak; the two cache/marking false cures were
+the same trap). Rule now enforced: only oracles with hundreds of calls
+(60-step real-data runs) or hard gates count as evidence here.
+
+Instrumentation (monkeypatched _ConvGelu.backward, real data): first
+nan is an OUTPUT of the block1 (cin=32) generic dgrad kernel at
+backward call 112 - dx nan, dweight clean, grad_output/x/weight/pre
+all verified finite before and after. Zero-initialized dx still NaNs
+3/3, so the kernel computes nan from finite inputs; it is not reading
+stale uninitialized bytes. It passes isolated unit tests at production
+shapes consistently, which is how the merge shipped it - real-loop
+allocator/stream state matters to whatever mis-indexed load or
+miscompile this is (both sm_120 and sm_86 reproduce).
+
+Action: PAN2_CONV_GELU_TRITON env, default OFF (ref conv+GELU serves
+everywhere; state_dict unaffected; kC's unit tests now vacuously
+compare ref vs ref - noted). Cost measured on GPU0: wall 7.19 -> 7.78
+ms/step, kernel self 5.48 -> 6.48. Gates on the disabled stack: pytest
+73/73, ruff clean, 3x 60-step real-data runs finite at bs32, 2x at
+bs=64, 2x smoke, GPU1 60-step real-data + compile-default smoke clean
+(GPU1's nan was this same flake, not an arch-specific compile issue).
+train_steps now hard-raises on any non-finite loss (the smoke-only
+gate did not cover real runs).
+
+Also landed here: bs=64 pretrain default (user-approved; -19%
+ms/sample measured in the batch sweep; 2x 60-step real-data finite),
+PAN2_MODEL_COMPILE_MODE for the whole-model compile branch (was
+hardcoded reduce-overhead; whole-model default-mode compile measured
+flat, 7.20 vs 7.14 ms wall GPU0, so cfg compile stays off), probe8
+verified 3x clean for whole-model default compile.
+
+Open: dgrad flake root cause (fix lane in a worktree; acceptance =
+5x 60-step real-data clean runs + unit tests + benches beating ref).
+Recovering the 0.59 ms/step is the prize.

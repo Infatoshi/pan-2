@@ -13,7 +13,9 @@ model:
 
 train:
   stage: pretrain
-  batch_size: 32
+  # 64 not 32: -19% ms/sample measured (sweep 2026-07-15) and doubles
+  # in-batch negatives 32 -> 64 for the contrastive loss (user-approved)
+  batch_size: 64
   lr: 0.0003
   max_steps: 10000
   log_every: 50
