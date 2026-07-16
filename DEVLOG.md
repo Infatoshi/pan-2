@@ -595,3 +595,53 @@ gn_gelu 0.255 (4.6%), inductor_pointwise 0.192 (3.5%), conv_fwd 0.050
 largest single kernels: _conv_gelu_wgrad 0.561 + _conv_gelu_fwd 0.473.
 This closes #25's GPU0 end-to-end profile; next-largest honest target
 is the gemm/opportunity work queued as kE (#26).
+
+## 2026-07-15 - kE epilogue-fused gemms: honest negative, and round 2 of the NaN
+
+kE (delegated, codex): fuse fc1+bias+exact-GELU and proj/fc2+residual
+into Triton matmuls with M=2144 wave-tail tile tuning. Result: NOTHING
+landed and the branch was deleted - every candidate lost to the
+cuBLAS+pointwise baseline it replaces. Delegate-measured on GPU0
+(uncontended): proj+residual addmm 0.87x of existing (0.0153 vs 0.0132
+ms), fc2 bias+residual 0.85x, fc1 fused GELU no qualifying result; on
+the 3090 every Triton fwd+bwd path also lost (fc1 0.3371 vs 0.4203 ms,
+proj 0.0918 vs 0.1300, fc2 0.2788 vs 0.3658; baseline vs fused).
+64-row tiles improved the wave tail but not enough to beat cuBLAS at
+these bf16 shapes. Conclusion recorded so nobody re-rolls plain
+block-matmul Triton at M=2144x{512,1536,2048}: the gemm bucket
+(1.673/5.48 ms/step self) stays; remaining levers are
+max-autotune-gemm-style experiments or batch-shape decisions, i.e.
+config/architecture moves rather than hand kernels.
+
+Round 2 of the NaN (triggered by a kE side observation). The kE
+delegate reported baseline @ 497e01e NaNing posttrain on GPU1 under
+compile-default. First suspicion was inductor-cache poisoning from
+delegate experiments (a fresh cache dir produced one clean GPU1 run).
+Disproven: after wiping /tmp/torchinductor_infatoshi aside, GPU1
+default-mode NaN'd 3/3 on the repopulating cache and 3/3 more on three
+independent fresh cache dirs (one earlier single clean fresh-cache run
+was another false signal - the repo rule "believe a cure after 3/3"
+applies to controls too). GPU0 meanwhile kept its split behavior on
+the fresh cache: default clean, reduce-overhead NaN. GPU1 bisect:
+PAN2_FUSED_ADAMW=0 clean, conv_gelu removed clean, both present NaN -
+the SAME three-component combination as GPU0 (conv_gelu + FusedAdamW +
+inductor compile), and anomaly detection names the same site on both
+arches: "_ConvGeluBackward returned nan values in its 0th output"
+(block1 dx). Mechanism beyond the triad is OPEN (not cudagraphs on
+GPU1, not the cache, not memcheck-visible OOB). Production rules now in
+CLAUDE.md: GPU0 runs compile mode=default (verified clean 4/4 across
+old and fresh caches; it is also the primary target), GPU1 runs with
+PAN2_TEMPORAL_COMPILE=0 until root-caused. The delegate-facing lesson
+that DID stick: delegates get cache-hygiene instructions in prompts
+(any deterministic-NaN investigation must include a fresh-cache
+control), and GPU0 was contended by KernelBench-Hard during kE -
+bench attribution above is uncontended windows only.
+
+Campaign state: all delegated kernel lanes closed. Merged stack on
+main: gather_cast/scale_cast (#25), fused AdamW (kD), conv_gelu
+frontend (kC), compile-mode fix (497e01e). Remaining open items:
+whole-model compile at mode=default for the 1.71 ms host-side residual
+(loop.py:47 still selects reduce-overhead when cfg.train.compile=true -
+do not flip that on as-is), the bs=64 sample-efficiency question with
+the user, then data-pipeline work dominates per the SPEC (DATA is the
+binding constraint, not kernels).
