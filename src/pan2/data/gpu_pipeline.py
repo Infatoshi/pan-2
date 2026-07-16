@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from pan2 import kernels
 from pan2.data.shards import MANIFEST_NAME, load_manifest
 
 
@@ -55,6 +56,8 @@ class PipelineConfig:
     refresh_prob: float = 0.05
     # min fill fraction before yielding batches
     min_fill: float = 0.05
+    # dtype the fused gather+cast emits (production trains under bf16 autocast)
+    out_dtype: torch.dtype = torch.bfloat16
     # ffmpeg binary
     ffmpeg: str = "ffmpeg"
 
@@ -302,7 +305,12 @@ class _Producer(threading.Thread):
 
 
 class PipelinedGpuPretrainLoader:
-    """Iterable of pretrain batches {frames, goal} already on GPU (uint8)."""
+    """Iterable of pretrain batches {frames, goal, neg} already on GPU.
+
+    Slot layout at fill: [ctx toks | goal | neg], goal/neg baked per slot
+    (goal 1s..15s after context end; neg past the goal window, same clip).
+    Batches are emitted in cfg.out_dtype channels-last (fused gather+cast).
+    """
 
     def __init__(self, cfg: PipelineConfig):
         if not torch.cuda.is_available():
@@ -475,15 +483,16 @@ class PipelinedGpuPretrainLoader:
             # becoming the bottleneck (see refresh_prob ceiling notes)
             self.stats["ready_low"] = min(self.stats["ready_low"], self.ring.num_ready())
 
-        # frames: [B, t_slot, 3, H, W] views via index — clone to contiguous batch
-        # index_select is fine; avoids holding slot forever
+        # fused: gather slots + uint8->out_dtype scaled cast + channels_last in
+        # one kernel (~6x less traffic than the eager chain at production
+        # shape); falls back to the torch reference composition off-CUDA.
         slot_t = torch.tensor(slots, device=self.device, dtype=torch.long)
-        frames = self.ring.frames.index_select(0, slot_t)  # B,T,C,H,W
-        # slot layout: [ctx toks | goal | neg], goal/neg baked at fill time
-        # (goal 1s..15s after context end; neg past the goal window, same clip)
-        neg = frames[:, -1]
-        goal = frames[:, -2]
-        ctx = frames[:, :-2]
+        t_slot = self.ring.frames.shape[1]
+        ctx, tail = kernels.get("gather_cast")(
+            self.ring.frames, slot_t, 1.0 / 255.0, self.cfg.out_dtype, t_slot - 2
+        )
+        ctx = ctx.view(bs, t_slot - 2, *ctx.shape[1:])
+        goal, neg = tail.view(bs, 2, *tail.shape[1:]).unbind(1)
 
         # refresh a few used slots so producers keep cycling fresh clips/goals
         for s in slots:

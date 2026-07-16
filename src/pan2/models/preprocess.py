@@ -3,6 +3,15 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from pan2 import kernels
+
+
+def _cast_dtype() -> torch.dtype:
+    """Destination dtype for uint8 images: the autocast dtype when active."""
+    if torch.cuda.is_available() and torch.is_autocast_enabled("cuda"):
+        return torch.get_autocast_dtype("cuda")
+    return torch.float32
+
 
 def prepare_images(
     x: torch.Tensor,
@@ -20,7 +29,7 @@ def prepare_images(
         raise ValueError(f"expected 4D or 5D image tensor, got {tuple(x.shape)}")
 
     if x.dtype == torch.uint8:
-        x = x.to(dtype=torch.float32, memory_format=torch.channels_last).mul_(1.0 / 255.0)
+        x = kernels.get("scale_cast")(x, 1.0 / 255.0, _cast_dtype())
     elif x.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         x = x.to(dtype=torch.float32, memory_format=torch.channels_last)
     else:
