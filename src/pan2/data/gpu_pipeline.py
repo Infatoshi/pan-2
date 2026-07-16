@@ -39,9 +39,15 @@ class PipelineConfig:
     image_size: int = 64
     budget_gb: float = 10.0
     num_producers: int = 8
-    prefer_source: str = "auto"  # auto | shard | mp4 | npy
+    prefer_source: str = "auto"  # auto | shard | mp4 | npy | pack
     device: str = "cuda"
     seed: int = 0
+    # fps of the underlying source data; decode -ss timing and goal horizons
+    # are computed in these native-frame units (VPT data: 20, pack refs: 10)
+    native_fps: float = 20.0
+    # pack corpus (custom crawl layout): index npz from scripts/build_pack_index.py
+    pack_index: str = ""
+    pack_minecraft_only: bool = False
     # goal = frame strictly after the context window, horizon in native frames
     # (20Hz): defaults 1s..15s into the future
     min_goal_horizon: int = 20
@@ -154,13 +160,16 @@ def _decode_mp4_window(
     num_frames: int,
     image_size: int,
     ffmpeg: str = "ffmpeg",
+    fps: float = 20.0,
+    scale: bool = True,
 ) -> np.ndarray:
-    """Decode a contiguous window to uint8 NHWC RGB via ffmpeg (scale to image_size).
+    """Decode a contiguous window to uint8 NHWC RGB via ffmpeg.
 
-    Uses stream copy positioning via -ss after -i for accuracy; for speed, -ss before -i.
+    -ss before -i: seeks to the keyframe at/below the timestamp and decodes
+    forward, discarding stale frames (exact-frame placement for decoding).
+    scale=False skips the -vf chain entirely (source already at image_size —
+    the pack ref64 layout), maximizing decode throughput.
     """
-    # approx timestamp at 20fps (VPT contractor)
-    fps = 20.0
     ss = max(0.0, start_frame / fps)
     cmd = [
         ffmpeg,
@@ -172,14 +181,10 @@ def _decode_mp4_window(
         str(mp4),
         "-frames:v",
         str(num_frames),
-        "-vf",
-        f"scale={image_size}:{image_size}",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
     ]
+    if scale:
+        cmd += ["-vf", f"scale={image_size}:{image_size}"]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     need = num_frames * image_size * image_size * 3
     if proc.returncode != 0 or len(proc.stdout) < need:
@@ -290,6 +295,8 @@ class _Producer(threading.Thread):
                 num_frames=t_load,
                 image_size=self.cfg.image_size,
                 ffmpeg=self.cfg.ffmpeg,
+                fps=self.cfg.native_fps,
+                scale=int(item.get("native_size", 0)) != self.cfg.image_size,
             )
         horizon = self.rng.randint(self.cfg.min_goal_horizon, self.cfg.max_goal_horizon)
         goal = window[t_full - 1 + horizon]  # strictly after context end
@@ -351,6 +358,8 @@ class PipelinedGpuPretrainLoader:
 
     def _discover_items(self) -> list[dict]:
         prefer = self.cfg.prefer_source
+        if prefer == "pack":
+            return self._pack_items()
         shards = Path(self.cfg.shards_dir)
         if prefer in ("auto", "shard") and (shards / MANIFEST_NAME).exists():
             items = self._shard_items(shards)
@@ -413,6 +422,55 @@ class PipelinedGpuPretrainLoader:
                 else:
                     rec["max_start"] = 4000
             items.append(rec)
+        return items
+
+    def _pack_items(self) -> list[dict]:
+        """Items from the crawl-corpus pack index (scripts/build_pack_index.py).
+
+        The index carries exact frame counts, so max_start is real (no
+        probing, no guessing like the mp4 branch). Episodes shorter than
+        t_load are skipped. Index fps/image_size must match the loader
+        config — the pack contract is decode-at-native, no in-pipe scaling.
+        """
+        idx_path = Path(self.cfg.pack_index)
+        if not idx_path.is_file():
+            raise FileNotFoundError(f"pack source requested but no index at {idx_path}")
+        z = np.load(idx_path)
+        if int(z["version"]) != 1:
+            raise ValueError(f"unsupported pack index version {int(z['version'])}")
+        if abs(float(z["fps"]) - self.cfg.native_fps) > 1e-6:
+            raise ValueError(
+                f"pack index fps {float(z['fps'])} vs cfg.native_fps {self.cfg.native_fps}"
+            )
+        native_size = int(z["image_size"])
+        if native_size != self.cfg.image_size:
+            raise ValueError(
+                f"pack index is {native_size}px, loader asked {self.cfg.image_size}px "
+                "(pack v1 decodes at native size, no in-pipe scaling)"
+            )
+        t_load = self.cfg.context_len + 2 * self.cfg.max_goal_horizon
+        n_ep = len(z["stem"])
+        items: list[dict] = []
+        for i in range(n_ep):
+            if self.cfg.pack_minecraft_only and not bool(z["minecraft"][i]):
+                continue
+            n = int(z["n_frames"][i])
+            if n < t_load:
+                continue
+            items.append(
+                {
+                    "stem": str(z["stem"][i]),
+                    "source": "pack",
+                    "mp4": str(z["path"][i]),
+                    "max_start": n - t_load,
+                    "native_size": native_size,
+                }
+            )
+        if not items:
+            raise FileNotFoundError(
+                f"empty pack items from {idx_path} "
+                f"(minecraft_only={self.cfg.pack_minecraft_only}, t_load={t_load})"
+            )
         return items
 
     def _shard_items(self, shards: Path) -> list[dict]:

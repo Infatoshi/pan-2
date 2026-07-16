@@ -19,9 +19,18 @@ def main() -> None:
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--budget-gb", type=float, default=10.0)
     p.add_argument("--producers", type=int, default=8)
-    p.add_argument("--prefer-source", default="auto", choices=["auto", "shard", "npy", "mp4"])
+    p.add_argument("--prefer-source", default="auto",
+                   choices=["auto", "shard", "npy", "mp4", "pack"])
     p.add_argument("--raw-dir", default="/data/pan-2/raw")
     p.add_argument("--episodes-dir", default="/data/pan-2/episodes")
+    p.add_argument("--pack-index", default="",
+                   help="pack_index.npz from scripts/build_pack_index.py "
+                        "(required when --prefer-source pack)")
+    p.add_argument("--pack-minecraft-only", action="store_true",
+                   help="restrict pack items to minecraft-flagged episodes")
+    p.add_argument("--native-fps", type=float, default=None,
+                   help="source fps for seek/horizon units (default 10 for "
+                        "pack, 20 otherwise)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -31,6 +40,10 @@ def main() -> None:
     cfg.model.frame_subsample = 1  # already_subsampled in ring
     state = build_state(cfg)
     cfg.model.frame_subsample = data_sub  # restore for pipeline config below
+
+    native_fps = args.native_fps
+    if native_fps is None:
+        native_fps = 10.0 if args.prefer_source == "pack" else 20.0
 
     pcfg = PipelineConfig(
         raw_dir=args.raw_dir,
@@ -45,6 +58,9 @@ def main() -> None:
         device=cfg.train.device,
         min_goal_horizon=cfg.train.min_goal_horizon,
         max_goal_horizon=cfg.train.max_goal_horizon,
+        native_fps=native_fps,
+        pack_index=args.pack_index,
+        pack_minecraft_only=args.pack_minecraft_only,
     )
     loader = PipelinedGpuPretrainLoader(pcfg)
 

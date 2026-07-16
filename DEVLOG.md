@@ -820,3 +820,52 @@ Open/next: preview training path on the new corpus (build_shards.py
 needs an --fps flag: decode_mp4 has no fps handling; plan fps=20 ->
 existing 20Hz/64px contract, zero pipeline changes; 128px/10fps
 Pan-1-aligned layout is a data-layout decision for the user).
+
+## 2026-07-16 (pm) - Custom pack data layout: 39GB corpus, 4.44 h/s E2E
+
+User directive: custom data layout, small, decompress on the fly
+superfast, training as fast as possible. Shipped v1 end-to-end and
+measured every load-bearing number first.
+
+Engine selection (benches on real refs, box co-running transcodes):
+- seek-per-window random access caps everything: PyAV 1.1k fps (rgb
+  conversion ~7x the decode), torchcodec cpu 6.6k, torchcodec NVDEC 4.0k
+- NVDEC DEAD for v1: rejects width<144 ("not within range from 144 to
+  8192" - our 128px and any 64px refs); at 144px every ffmpeg/torchcodec
+  path syncs per frame -> 7-12k fps, no 4-stream scaling. v2 = async
+  surface queue or nvJPEG, documented in docs/data-layout.md
+- sequential ffmpeg: 11-26k fps/instance @128px frame-threaded, ~2.5x
+  cheaper/frame @64px (same-video A/B)
+- ring math (measured constants): refresh_prob 0.05 -> ~146 fresh
+  slots/s x 428 frames = ~54k decoded fps demand. 64px CPU envelope
+  holds that with 12 stateless producers -> persistent pipes / annexb /
+  GPU decode all buy nothing in v1
+
+Layout (docs/data-layout.md is the contract): ref64/ (64px/10fps x265
+crf28 GOP20, EXACT 1:1 frame equality vs ref/) + pack_index.npz (exact
+n_frames, crude title-only minecraft flag - channel names excluded,
+they flag everything), 8.6MB/h => ~39GB per 4,400h. Loader:
+prefer_source="pack", -ss-before-i exact-frame seeks (bit-exact test at
+GOP straddles), decode-at-native no scale, native_fps plumbing, exact
+max_start. stride exactly once (10fps ingest = the subsample; k=1 ring
+and model).
+
+E2E (GPU0 lease, bs64, ctx128@10fps, 1000 steps, 81 episodes / 34.1h):
+51-54 ms/step steady = 4.44 h-video/s vs 4.80 shard-path (delta =
+co-running encode CPU). errors=0, 5455 fills, ring never starved, loss
+1.10 -> 0.010. 7 new tests (index builder 2, loader parity 5), pytest
+84/84, ruff clean.
+
+Lessons:
+- compute the fill demand before picking a decode engine: the 350k fps
+  "requirement" (every step freshly decoded) was 6.5x the real ring
+  number; it was driving the design toward a GPU-decode build-out the
+  ring makes unnecessary
+- NVDEC tiny-frame reality: min-width 144 plus sync-per-frame APIs ->
+  hardware decoders are a non-option until someone owns an async queue
+- ffprobe-counted frame counts in an index beat act-file probing:
+  exact max_start removes the mp4 branch's 4000/5000 guesses
+
+Next: tonight's preview run (rebuild index over the grown ref64 set
+~21:00, 100k steps ~90 min on GPU0); topic queue stays: wrong-horizon
+negatives, cross-episode goals, fine-detail codec probes.

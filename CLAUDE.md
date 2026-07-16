@@ -42,6 +42,9 @@ model churn.
 - Local artifacts: `~/dev/pan-2/data/{checkpoints,cache,shards}`
 - YouTube crawl corpus (gitignored, anvil-local): `~/dev/pan-2/data/crawl/`
   - `raw/` — 9,733 scraped videos, 1.10TB (~4,400h); `ref/` — verified 128px/10fps crf28 reference views
+  - `ref64/` — 64px/10fps crf28 refs (1:1 frames vs ref/) — train reads this via `--prefer-source pack`
+  - `pack/pack_index.npz` — episode index; rebuild with `scripts/build_pack_index.py` as ref64 grows
+  - Layout contract: `docs/data-layout.md`
   - `state/STOP` halts workers, `state/STOP_TC` halts transcode; `bin/` has worker/supervisor/transcode scripts; logs in `logs/`
 
 ## Commands
