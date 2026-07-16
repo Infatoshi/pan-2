@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from pan2.config import Config
+from pan2.kernels.fused_adamw import build_adamw
 from pan2.models.policy import PanPolicy
 from pan2.train.losses import action_loss, contrastive_loss
 from pan2.train.speed import configure_cuda_fast_math
@@ -40,11 +41,13 @@ def build_state(cfg: Config) -> TrainState:
     if cfg.train.compile and device.type == "cuda":
         # reduce-overhead good for steady train step; fullgraph=False for SDPA flexibility
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False)  # type: ignore[assignment]
-    optim = torch.optim.AdamW(
+    # PAN2_FUSED_ADAMW=1 (default): multi-tensor Triton AdamW on CUDA;
+    # =0: stock torch.optim.AdamW (fused=True on CUDA).
+    optim = build_adamw(
         model.parameters(),
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
-        fused=device.type == "cuda",
+        device_type=device.type,
     )
     return TrainState(model=model, optim=optim, device=device, raw_model=raw_model)
 

@@ -50,9 +50,12 @@ def test_ring_reads_shard_source(tmp_path):
     assert ctx.shape == (4, 9, 3, 8, 8)  # 9 ctx tokens (k=2 keeps last), then goal/neg slots
     assert goal.shape == neg.shape == (4, 3, 8, 8)
     # ramp: pixel value == native frame index in the loaded window, so the
-    # goal gap vs the last ctx token (window[15]) is the horizon itself
-    last_ctx = ctx[:, -1, 0, 0, 0].int()
-    goal_gap = (goal[:, 0, 0, 0].int() - last_ctx).cpu()
-    neg_gap = (neg[:, 0, 0, 0].int() - last_ctx).cpu()
+    # goal gap vs the last ctx token (window[15]) is the horizon itself.
+    # Batches arrive scaled (uint8/255, cfg.out_dtype), so unscale first;
+    # bf16 has >2^-9 relative margin here, round() recovers the index.
+    px = lambda t: (t * 255).round().int()  # noqa: E731
+    last_ctx = px(ctx[:, -1, 0, 0, 0])
+    goal_gap = (px(goal[:, 0, 0, 0]) - last_ctx).cpu()
+    neg_gap = (px(neg[:, 0, 0, 0]) - last_ctx).cpu()
     assert torch.all(goal_gap >= 2) and torch.all(goal_gap <= 4)
     assert torch.all(neg_gap > 4)
