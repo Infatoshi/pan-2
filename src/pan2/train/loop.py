@@ -42,9 +42,9 @@ def build_state(cfg: Config) -> TrainState:
     if cfg.train.compile and device.type == "cuda":
         # Whole-model compile. Same mode story as the temporal stack (see
         # models/temporal.py): keep "default" in production - cudagraph trees
-        # ("reduce-overhead") are a live NaN landmine with conv_gelu +
-        # FusedAdamW in the process (CLAUDE.md). fullgraph=False splits around
-        # the custom autograd Functions instead of erroring.
+        # ("reduce-overhead") buy ~0.34 ms/step at most, and the NaNs once
+        # blamed on them were the conv_gelu dgrad flake (fixed, kF; DEVLOG).
+        # fullgraph=False splits around the custom autograd Functions.
         mode = os.environ.get("PAN2_MODEL_COMPILE_MODE", "default")
         model = torch.compile(model, mode=mode, fullgraph=False)  # type: ignore[assignment]
     # PAN2_FUSED_ADAMW=1 (default): multi-tensor Triton AdamW on CUDA;

@@ -173,10 +173,10 @@ def build_temporal(name: str, **kwargs) -> nn.Module:
         # Disable with PAN2_TEMPORAL_COMPILE=0 for debugging.
         # PAN2_TEMPORAL_COMPILE_MODE selects the inductor mode. Keep "default"
         # in production: cudagraph trees ("reduce-overhead") recover only
-        # ~0.34 ms/step of launch gaps (7.19 -> 6.85 ms wall, GPU0 2026-07-15)
-        # and, with FusedAdamW + conv_gelu active in the process, they
-        # deterministically NaN training after any eval forward or second
-        # compiled model instance (2026-07-15 nan hunt; see DEVLOG).
+        # ~0.34 ms/step of launch gaps (7.19 -> 6.85 ms wall, GPU0 2026-07-15).
+        # The NaNs once blamed on them (2026-07-15 hunt) were the conv_gelu
+        # dgrad flake, root-caused and fixed same-day (kF; DEVLOG) - "ro" mode
+        # was never causal, just not worth 0.34 ms of graph-capture risk.
         if (
             _env_flag("PAN2_TEMPORAL_COMPILE", default=True)
             and torch.cuda.is_available()

@@ -408,17 +408,19 @@ def _supported_shape(
 
 
 def _env_triton_enabled() -> bool:
-    # PAN2_CONV_GELU_TRITON default OFF. 2026-07-15 flake root cause (kF):
-    # generic dgrad parity-strided kh loop used trip count ceil(K/STRIDE),
-    # which overshoots when kh_start != 0 (KH=3,s=2,kh_start=1 -> kh=1,3).
-    # dpre was masked for kh>=KH but weight was not; OOB weight loads read
-    # neighboring device memory (often nan under allocator reuse) and
-    # 0*nan poisoned tl.dot. Fixed by clamping weight addresses in-bounds
-    # and masking loads for kh>=KH / kw>=KW. Keep default off until
-    # acceptance re-runs flip it; opt in with =1.
+    # PAN2_CONV_GELU_TRITON default ON. 2026-07-15 flake root-caused and
+    # fixed (kF, same-day): the generic dgrad parity-strided kh loop used
+    # trip count ceil(K/STRIDE), overshooting when kh_start != 0
+    # (KH=3,s=2,kh_start=1 -> kh=1,3). dpre was masked for kh>=KH but
+    # weight was not; OOB weight loads hit neighboring device memory
+    # (often nan under allocator reuse) and 0*nan poisoned tl.dot. Fixed
+    # by clamping weight addresses in-bounds and masking loads for
+    # kh>=KH / kw>=KW. Verified by the deterministic nan-tail regression
+    # in tests/test_kernel_conv_gelu.py and 10/10 60-step real-data runs
+    # (bs32+bs64, delegate + our own re-runs). Set =0 to force ref (A/B).
     raw = os.environ.get("PAN2_CONV_GELU_TRITON")
     if raw is None:
-        return False
+        return True
     return raw.strip().lower() not in ("0", "false", "off", "no")
 
 

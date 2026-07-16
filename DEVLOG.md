@@ -693,3 +693,56 @@ verified 3x clean for whole-model default compile.
 Open: dgrad flake root cause (fix lane in a worktree; acceptance =
 5x 60-step real-data clean runs + unit tests + benches beating ref).
 Recovering the 0.59 ms/step is the prize.
+
+## 2026-07-15 - dgrad flake ROOT-CAUSED and fixed (kF); Triton conv path back ON
+
+Delegate (grok) in worktree kF/conv-dgrad-flake, root cause pinned with
+a deterministic counter-test, not vibes:
+
+The generic dgrad kernel's parity-strided filter loop used trip count
+ceil(K/STRIDE). For block1 (KH=3, s=2) with kh_start=1 that yields
+kh=1,3 - kh=3 is out of bounds for a length-3 filter. dpre loads were
+already masked for kh>=KH (0); WEIGHT loads were not. The OOB weight
+address reads past the packed channels-last buffer into neighboring
+device memory, which under training allocator reuse often contains nan
+from earlier grads. Masked-dpre (0) times OOB-weight (nan) is 0*nan =
+nan inside tl.dot, poisoning the whole dx tile. Matches every forensic
+fact on record: finite verified inputs producing nan (call #112),
+~1%/call in real loops only (needs junk adjacent to the weight
+allocation), isolated unit tests clean (clean adjacent memory), wgrad
+clean (always in-bounds pattern), stem dgrad clean (range(KH) loop),
+both sm_120 and sm_86, zeros-init dx no cure (computed, not stale).
+num_stages had nothing to do with it.
+
+Fix (3eb3edf, 34 lines): clamp the weight address in-bounds
+(kh_safe = min(kh, KH-1), same for kw) and extend the weight load mask
+with (kh < KH) & (kw < KW), so the overshoot taps read real in-bounds
+words and contribute exactly 0. Bit-exact for all previously-correct
+parity cases.
+
+Verification, all re-run by us, not just the delegate:
+- deterministic regression test: nan in the 8192 elements after the
+  packed weight buffer; old kernel 98304/131072 dx nan, fixed kernel 0
+  nan, fixed vs old-with-zero-tail maxdiff 0.0
+- triton-vs-ref test asserts _can_use_triton with env forced on (kills
+  the ref-vs-ref vacuity noted in the previous entry)
+- pytest 77/77 with env off and forced on; ruff clean
+- oracle 10/10 60-step real-data runs finite (5x bs32 + 5x bs64,
+  PAN2_CONV_GELU_TRITON=1; bs64 doubles conv-bwd calls/step) on top of
+  the delegate's own 5/5
+- bench GPU1 3090 fwd+bwd N=2080: stem 5.15 vs 7.20 ms ref (1.40x),
+  b1 1.94 vs 1.92 (~1.0x, cuDNN parity on Ampere); delegate's GPU0
+  bench: stem 3.09x, b1 1.10x
+
+PAN2_CONV_GELU_TRITON default back to ON (=0 forces ref, A/B only).
+Recovers the 0.59 ms/step the disable cost (7.78 -> 7.19 ms wall
+territory, GPU0, conv-on vs conv-off measured earlier today). The
+triad-era comments in temporal.py/loop.py now say plainly that
+cudagraph trees were never causal; mode="default" stands on its own
+0.34-ms-upside merits. train_steps finite-loss gate stays as the
+permanent backstop.
+
+Lesson now codified in the nan-tail regression test: any strided/parity
+filter loop with trip count ceil(K/S) must mask EVERY operand of the
+dot, not just the data operand - one unmasked operand turns index
+overshoot into value nondeterminism that isolated unit tests cannot see.
