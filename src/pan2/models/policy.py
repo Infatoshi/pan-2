@@ -53,7 +53,7 @@ class PanPolicy(nn.Module):
     def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
         # frames: [B, T, C, H, W] prepared float, already time-subsampled
         b, t, c, h, w = frames.shape
-        flat = frames.reshape(b * t, c, h, w)
+        flat = frames.flatten(0, 1)
         tok = self.encoder(flat)
         return tok.view(b, t, -1)
 

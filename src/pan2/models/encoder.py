@@ -5,6 +5,19 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
+from pan2 import kernels
+
+
+class KernelGroupNormGELU(nn.GroupNorm):
+    """GroupNorm module whose activation is fused through the kernel registry."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight is None or self.bias is None:
+            raise RuntimeError("KernelGroupNormGELU requires affine parameters")
+        return kernels.get("group_norm_gelu")(
+            x, self.weight, self.bias, self.num_groups, self.eps
+        )
+
 
 def _dw_block(name: str, cin: int, cout: int, stride: int) -> nn.Sequential:
     return nn.Sequential(
@@ -15,8 +28,13 @@ def _dw_block(name: str, cin: int, cout: int, stride: int) -> nn.Sequential:
                     nn.Conv2d(cin, cin, 3, stride=stride, padding=1, groups=cin, bias=False),
                 ),
                 (f"{name}_pw", nn.Conv2d(cin, cout, 1, bias=False)),
-                (f"{name}_gn", nn.GroupNorm(num_groups=min(8, cout), num_channels=cout)),
-                (f"{name}_act", nn.GELU()),
+                (
+                    f"{name}_gn",
+                    KernelGroupNormGELU(
+                        num_groups=min(8, cout), num_channels=cout
+                    ),
+                ),
+                (f"{name}_act", nn.Identity()),
             ]
         )
     )
@@ -77,6 +95,9 @@ class FrameEncoder(nn.Module):
 
         # keep .net alias for anything that expects sequential
         self.net = nn.Sequential(self.stem, self.block1, self.block2, self.block3, self.pool)
+        # Convert convolution filters once. Inputs and activations stay in this
+        # format through the complete convolutional encoder.
+        self.to(memory_format=torch.channels_last)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)

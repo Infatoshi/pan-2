@@ -54,3 +54,8 @@ def reference(name: str) -> Callable:
 
 def available() -> list[str]:
     return sorted(set(_IMPL) | set(_REF))
+
+
+# Import built-in ops after the registry API is defined so each module can
+# register its reference and optimized implementations at import time.
+from pan2.kernels import group_norm_gelu as _group_norm_gelu  # noqa: E402, F401
