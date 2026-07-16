@@ -171,11 +171,18 @@ def build_temporal(name: str, **kwargs) -> nn.Module:
         # Scoped torch.compile on the temporal stack: fuses residual/elementwise
         # copies that Triton alone cannot eliminate across attention boundaries.
         # Disable with PAN2_TEMPORAL_COMPILE=0 for debugging.
+        # PAN2_TEMPORAL_COMPILE_MODE selects the inductor mode. Keep "default"
+        # in production: cudagraph trees ("reduce-overhead") recover only
+        # ~0.34 ms/step of launch gaps (7.19 -> 6.85 ms wall, GPU0 2026-07-15)
+        # and, with FusedAdamW + conv_gelu active in the process, they
+        # deterministically NaN training after any eval forward or second
+        # compiled model instance (2026-07-15 nan hunt; see DEVLOG).
         if (
             _env_flag("PAN2_TEMPORAL_COMPILE", default=True)
             and torch.cuda.is_available()
         ):
-            module = torch.compile(module, mode="reduce-overhead", fullgraph=False)
+            mode = os.environ.get("PAN2_TEMPORAL_COMPILE_MODE", "default")
+            module = torch.compile(module, mode=mode, fullgraph=False)
         return module
     if name == "identity":
         return IdentityTemporal(**kwargs)

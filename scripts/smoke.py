@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -38,6 +39,10 @@ def main() -> None:
                 )
 
         logs = train_steps(state, cfg, gen(), n_steps=3)
+        # finite-loss gate: a NaN loss must fail the smoke, not print ok
+        # (the 2026-07-15 cudagraph NaN slipped through before this check)
+        if not all(math.isfinite(log["loss"]) for log in logs):
+            raise SystemExit(f"[{stage}] non-finite loss: {logs[-1]['loss']}")
         batch = synthetic_batch(
             cfg.train.batch_size,
             cfg.model.context_len,

@@ -537,3 +537,61 @@ Post-merge GPU1 profile (a171222): wall 21.2 -> 20.62 ms/step
 the 3090 BW roofline (100 MB / 936 GB/s); the convert/mul/index chain
 is gone from the kernel dump. GPU0 e2e delta lands with the kC batch
 profile (GPU0 occupied by the kC delegate at write time).
+
+## 2026-07-15 - kC conv frontend merged; cudagraph-trees NaN hunt blocked the push
+
+kC (delegated, codex): fused channels-last conv+exact-GELU frontend for the
+encoder (stem 3->32 7x7/s2 + block1 32->64 3x3/s2), custom Triton fwd
+(stores both y and pre-activation), epilogue-backward (GELU' from pre),
+packed stem dgrad, generic dgrad, split-K wgrad into fp32. Guards pin the
+Triton path to the exact production shapes/dtypes/CL layouts; everything
+else falls back to the pure-torch ref. Acceptance re-run by us before
+merge (68c15c1): encoder fwd+bwd at production rows -27.7%, stem leg
+1.76x, block1 1.10x vs cudnn+eager-GELU baseline; delegate-reported e2e
+7.86 -> 6.97 ms on GPU0 in its worktree.
+
+Posttrain smoke then NaN'd deterministically at posttrain step 2 (grad
+nan on encoder.stem.conv.weight), so the merge was held unpushed. Full
+bisect (probe scripts, /tmp/nan_probe*.py): the NaN requires the
+COMBINATION conv_gelu + FusedAdamW + cudagraph trees (PAN2_TEMPORAL_COMPILE
+at reduce-overhead) + a real train_steps pretrain phase + an eval
+forward without autocast in the same process before posttrain. Any one
+removed: clean. Manual eager stepping in both stages: clean. Anomaly
+detection localizes the first nan output to `_ConvGeluBackward` (block1
+dx path, propagating up to stem). compute-sanitizer memcheck: zero
+invalid accesses (our kernels hygienic). PYTORCH_NO_CUDA_MEMORY_CACHING=1
+trips torch's own internal invariant ("storage data ptrs not allocated
+in pool... could be a bug in inductor aliasing tracking"), which put
+cudagraph-trees pool bookkeeping in the frame.
+
+Two failed "cures", recorded so nobody retries them:
+`torch.compiler.cudagraph_mark_step_begin()` at build_state, per
+iteration, and before eval forwards did NOT fix it (first single clean
+run was a false signal; 2/2 reruns NaN'd), and dynamo.reset variants
+moved the nan rather than removing it. Lesson now applied repo-wide:
+believe a NaN cure only after 3/3 reruns.
+
+Resolution: PAN2_TEMPORAL_COMPILE_MODE env added; production default
+flipped to mode="default" (inductor fusions intact, cudagraphs off).
+3/3 identical clean runs of the exact former repro. Cost measured on
+GPU0 (RTX PRO 6000 Blackwell, profile_step.py, 60-step wall):
+reduce-overhead 6.85 ms/step vs default 7.19 ms/step, i.e. cudagraphs
+buys ~0.34 ms of launch-gap elimination; kernel self-time identical
+(5.48 vs 5.50 ms). Not worth a landmine that detonates on any
+in-process eval or second compiled model; "reduce-overhead" stays
+available via env for single-model benchmarking. The build_state /
+per-iteration / pre-eval marks were removed again as non-fixes;
+CLAUDE.md carries the constraint. smoke.py now hard-fails on
+non-finite loss: before this gate, a NaN train run still printed
+"smoke ok".
+
+Post-everything GPU0 bucket map (production default mode, pretrain
+shape, wall 7.19 ms/step, self 5.48): gemm 1.673 (30.5%), conv_bwd
+1.126 (20.6%; includes remaining cudnn dgrad/wgrad calls worth a look),
+other 1.050 (19.2%; our Triton kernels mostly land here), adamw 0.442
+(8.1%), aten_pointwise 0.342 (6.2%), inductor_reduction 0.331 (6.0%),
+gn_gelu 0.255 (4.6%), inductor_pointwise 0.192 (3.5%), conv_fwd 0.050
+(0.9%), groupnorm_eager 0.017. Host-side residual 1.71 ms/step. Our
+largest single kernels: _conv_gelu_wgrad 0.561 + _conv_gelu_fwd 0.473.
+This closes #25's GPU0 end-to-end profile; next-largest honest target
+is the gemm/opportunity work queued as kE (#26).

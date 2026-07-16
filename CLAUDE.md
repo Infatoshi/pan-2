@@ -62,4 +62,5 @@ uv run python scripts/train_posttrain.py --config configs/posttrain_overfit.yaml
 - Subsample stride applied exactly once (model, or ring fill + model k=1). Never both.
 - Goals are strictly future frames; never reintroduce in-window goals.
 - Kernel speed is earned: ref impl + test + bench land in the same change as the kernel.
+- torch.compile mode: temporal stack uses `PAN2_TEMPORAL_COMPILE_MODE` (production default `default`). `reduce-overhead` (cudagraph trees) + FusedAdamW + conv_gelu deterministically NaNs training after any in-process eval forward or second compiled model, and marking step boundaries does not cure it (2026-07-15 hunt); its upside measured only ~0.34 ms/step on GPU0, so keep `default`.
 - Do not start multi-day pretrain until data layout is agreed and free space verified on `/` and `/data`.
