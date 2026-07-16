@@ -19,6 +19,23 @@ class KernelGroupNormGELU(nn.GroupNorm):
         )
 
 
+class KernelConvGELU(nn.Conv2d):
+    """Conv2d module whose exact GELU is fused through the kernel registry."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bias is not None:
+            raise RuntimeError("KernelConvGELU requires bias=False")
+        stride = self.stride[0]
+        padding = self.padding[0]
+        if torch.is_autocast_enabled("cuda"):
+            dtype = torch.get_autocast_dtype("cuda")
+            x = x.to(dtype=dtype)
+            weight = self.weight.to(dtype=dtype)
+        else:
+            weight = self.weight
+        return kernels.get("conv_gelu")(x, weight, stride, padding)
+
+
 def _dw_block(name: str, cin: int, cout: int, stride: int) -> nn.Sequential:
     return nn.Sequential(
         OrderedDict(
@@ -70,8 +87,13 @@ class FrameEncoder(nn.Module):
         self.stem = nn.Sequential(
             OrderedDict(
                 [
-                    ("conv", nn.Conv2d(in_channels, c1, 7, stride=2, padding=3, bias=False)),
-                    ("act", nn.GELU()),
+                    (
+                        "conv",
+                        KernelConvGELU(
+                            in_channels, c1, 7, stride=2, padding=3, bias=False
+                        ),
+                    ),
+                    ("act", nn.Identity()),
                 ]
             )
         )
@@ -81,9 +103,11 @@ class FrameEncoder(nn.Module):
                 [
                     (
                         "b1_conv",
-                        nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+                        KernelConvGELU(
+                            c1, c2, kernel_size=3, stride=2, padding=1, bias=False
+                        ),
                     ),
-                    ("b1_act", nn.GELU()),
+                    ("b1_act", nn.Identity()),
                 ]
             )
         )
