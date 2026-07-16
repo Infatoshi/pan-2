@@ -16,6 +16,7 @@ import torch
 
 from pan2.config import ModelConfig
 from pan2.data.gpu_pipeline import PipelineConfig, PipelinedGpuPretrainLoader
+from pan2.kernels.fused_adamw import build_adamw
 from pan2.models.policy import PanPolicy
 from pan2.train.losses import contrastive_loss
 from pan2.train.speed import configure_cuda_fast_math
@@ -28,7 +29,8 @@ mcfg = ModelConfig(image_size=64, d_model=512, n_layers=8, n_heads=8,
                    context_len=128, action_chunk=10, n_discrete=23,
                    mouse_dim=2, backbone="transformer", frame_subsample=1)
 model = PanPolicy(mcfg).to(device)
-optim = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
+# Honors PAN2_FUSED_ADAMW (default 1 = Triton multi-tensor AdamW on CUDA).
+optim = build_adamw(model.parameters(), lr=3e-4, weight_decay=0.01, device_type=device.type)
 pcfg = PipelineConfig(batch_size=32, budget_gb=8.0, num_producers=8)
 loader = PipelinedGpuPretrainLoader(pcfg)
 

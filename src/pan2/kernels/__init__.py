@@ -60,6 +60,7 @@ def _autoload() -> None:
     """Import kernel modules so they register themselves."""
     # Local imports: each module calls register() at import time.
     from pan2.kernels import bias_gelu as _bias_gelu  # noqa: F401
+    from pan2.kernels import fused_adamw as _fused_adamw  # noqa: F401
     from pan2.kernels import group_norm_gelu as _group_norm_gelu  # noqa: F401
     from pan2.kernels import layer_norm_affine as _layer_norm_affine  # noqa: F401
     from pan2.kernels import residual_add as _residual_add  # noqa: F401
