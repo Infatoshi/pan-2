@@ -428,3 +428,32 @@ same-session A/B deltas are quoted as earned.
 Follow-up fix on main: save/load now strip/re-insert compile's
 ._orig_mod. key segments so checkpoints round-trip between compiled
 and eager builds either direction (tests/test_ckpt_compile_compat.py).
+
+## 2026-07-15 — post-merge bottleneck map (kA+kB stacked)
+
+Re-profiled the production train step (ring k=2/model k=1, bs=32, bf16)
+with scripts/profile_step.py; hand-classified kernel names (flash
+attention kernels carry "cutlass" in template args, so regex buckets
+miscount attention as gemm if classified naively). Wall GPU0 7.25
+ms/step (kernel self-time 6.56; profiler-run drift band vs the 7.45 e2e
+run). GPU1 stacked wall 21.2 ms/step (kernel self 21.1) = -37% vs the
+33.8 same-session baseline.
+
+Bucket shares of kernel self-time, GPU0 / GPU1:
+- gemm 22.0% / 29.7% — now the top GPU0 bucket.
+- conv fwd 18.6% / 12.6%, conv bwd 17.2% / 21.0% — cudnn NHWC; single
+  largest kernel is one convolve_common_engine at 0.63 ms (9.6%).
+- eager GELU fwd+bwd 10.0% / 8.0% — policy/heads sites kB did not
+  cover; next fusion target.
+- aten pointwise/copies 7.3% / 6.0% — bf16 casts, direct_copy, adds.
+- adamw+foreach 7.2% / 4.4%.
+- attention (flash) 3.3% / 4.8% — small at T=67.
+- gn+gelu (kA Triton kernel) 3.9% / 3.8%; eager norms 4.0% (heads LN).
+- inductor fused pointwise+LN ~4.0% combined; memcpy/memset ~2.3%.
+- layout NCHW<->NHWC: 0 calls (was 8.0% / 117 calls per step).
+
+Attack order from here: (a) heads GELU+copies fusion (~9% worst-case),
+(b) conv bwd (dgrad+dw) — cudnn is already on NHWC engines, so the
+lever is algo/autotune, not layout, (c) gemm efficiency — cublas is
+serving sm80 cutlass binaries on sm_120; a torch build with sm120
+cublas kernels may move the 22% bucket without code changes.
