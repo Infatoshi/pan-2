@@ -252,15 +252,24 @@ if _HAS_TRITON:
         accumulator = tl.zeros((BLOCK_M, BLOCK_CIN), dtype=tl.float32)
         kernel_elements: tl.constexpr = KH * KW * CIN
 
+        # Parity-strided kh/kw: only filters that land on this input parity.
+        # Trip count is ceil(K/STRIDE), which overshoots when start != 0
+        # (KH=3,s=2,kh_start=1 -> kh=1,3). dpre was already masked for
+        # kh>=KH, but weight was not: OOB weight loads read neighboring
+        # device memory (often nan under allocator reuse) and 0*nan
+        # poisoned tl.dot. Clamp the weight address into-bounds and mask
+        # the load so invalid (kh,kw) contribute zero.
         kh_start = (parity // STRIDE + PADDING) % STRIDE
         kw_start = (parity % STRIDE + PADDING) % STRIDE
         for kh_index in range((KH + STRIDE - 1) // STRIDE):
             kh = kh_start + kh_index * STRIDE
+            kh_safe = tl.minimum(kh, KH - 1)
             oh_numerator = ih + PADDING - kh
             oh = oh_numerator // STRIDE
             valid_h = (kh < KH) & (oh_numerator >= 0) & (oh < OH)
             for kw_index in range((KW + STRIDE - 1) // STRIDE):
                 kw = kw_start + kw_index * STRIDE
+                kw_safe = tl.minimum(kw, KW - 1)
                 ow_numerator = iw + PADDING - kw
                 ow = ow_numerator // STRIDE
                 valid_spatial = (
@@ -284,12 +293,15 @@ if _HAS_TRITON:
                     )
                     weight_offsets = (
                         offs_cout[:, None] * kernel_elements
-                        + kh * KW * CIN
-                        + kw * CIN
+                        + kh_safe * KW * CIN
+                        + kw_safe * CIN
                         + offs_cin[None, :]
                     )
-                    weight_mask = (offs_cout[:, None] < COUT) & (
-                        offs_cin[None, :] < CIN
+                    weight_mask = (
+                        (offs_cout[:, None] < COUT)
+                        & (offs_cin[None, :] < CIN)
+                        & (kh < KH)
+                        & (kw < KW)
                     )
                     weight = tl.load(
                         weight_ptr + weight_offsets, mask=weight_mask, other=0.0
@@ -396,12 +408,14 @@ def _supported_shape(
 
 
 def _env_triton_enabled() -> bool:
-    # PAN2_CONV_GELU_TRITON=0 (default after the 2026-07-15 real-data flake):
-    # the generic dgrad kernel emits nan dx from finite inputs at ~1% of calls
-    # in real training loops (isolated unit tests pass; nan at training step
-    # 3-13, instrumented call #112, block1 cin=32, inputs verified finite).
-    # Opt back in with =1 only after a rewrite passes 5x 60-step real-data
-    # runs with train_steps' finite-loss gate. Details in DEVLOG 2026-07-15.
+    # PAN2_CONV_GELU_TRITON default OFF. 2026-07-15 flake root cause (kF):
+    # generic dgrad parity-strided kh loop used trip count ceil(K/STRIDE),
+    # which overshoots when kh_start != 0 (KH=3,s=2,kh_start=1 -> kh=1,3).
+    # dpre was masked for kh>=KH but weight was not; OOB weight loads read
+    # neighboring device memory (often nan under allocator reuse) and
+    # 0*nan poisoned tl.dot. Fixed by clamping weight addresses in-bounds
+    # and masking loads for kh>=KH / kw>=KW. Keep default off until
+    # acceptance re-runs flip it; opt in with =1.
     raw = os.environ.get("PAN2_CONV_GELU_TRITON")
     if raw is None:
         return False
