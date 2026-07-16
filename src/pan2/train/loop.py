@@ -106,6 +106,30 @@ def infinite_loader(loader: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
             yield batch
 
 
+def _plain_ckpt_keys(sd: dict) -> dict:
+    """Strip torch.compile's `._orig_mod.` segments so checkpoints are stable
+    regardless of which submodule was compiled when they were written."""
+    return {k.replace("._orig_mod.", "."): v for k, v in sd.items()}
+
+
+def _restore_ckpt_keys(model: torch.nn.Module, sd: dict) -> dict:
+    """Re-insert `._orig_mod.` for every compiled submodule of `model` so a
+    plain checkpoint loads into a build that has torch.compile enabled."""
+    prefixes = [
+        name
+        for name, sub in model.named_modules()
+        if name and hasattr(sub, "_orig_mod")
+    ]
+    for p in prefixes:
+        sd = {
+            (f"{p}._orig_mod.{k[len(p) + 1:]}"
+             if k.startswith(f"{p}.") and not k.startswith(f"{p}._orig_mod.")
+             else k): v
+            for k, v in sd.items()
+        }
+    return sd
+
+
 def save_ckpt(state: TrainState, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,7 +140,7 @@ def save_ckpt(state: TrainState, path: str | Path) -> None:
     torch.save(
         {
             "step": state.step,
-            "model": module.state_dict(),
+            "model": _plain_ckpt_keys(module.state_dict()),
             "optim": state.optim.state_dict(),
         },
         path,
@@ -128,7 +152,7 @@ def load_ckpt(state: TrainState, path: str | Path, load_optim: bool = True) -> T
     module = state.model
     if hasattr(module, "_orig_mod"):
         module = module._orig_mod  # type: ignore[attr-defined]
-    module.load_state_dict(ckpt["model"])
+    module.load_state_dict(_restore_ckpt_keys(module, _plain_ckpt_keys(ckpt["model"])))
     if load_optim and "optim" in ckpt:
         state.optim.load_state_dict(ckpt["optim"])
     state.step = int(ckpt.get("step", 0))

@@ -392,3 +392,39 @@ than assumed (GPU0, shard source, steady state):
   between samples. If it ever trends toward 0, data is becoming the
   bottleneck; the ceiling math to respond is in gpu_pipeline.py's
   refresh_prob notes.
+
+## 2026-07-15 — kernel batch 1: encoder fusion + transformer fusion (merged)
+
+Two delegated worktrees (codex kA encoder, grok kB transformer), each
+reviewed + acceptance re-run independently before merge. All numbers
+production config: ring loader (k=2 at fill, model k=1, 65 ctx tokens +
+goal/neg), bs=32, bf16 autocast, shard source.
+
+kA (96156aa, GPU0 RTX PRO 6000): channels_last encoder end-to-end +
+Triton fused GroupNorm+GELU (fp32 stats, exact erf). Fused op fwd
+8.9x / fwd+bwd 9.2-9.3x at both production shapes [2080,128,8,8],
+[2080,512,4,4]. Encoder fwd+bwd 6.40 -> 3.33 ms (-48%); NCHW<->NHWC
+layout kernels 117 calls / 8.96 ms -> 0 (profiler-verified).
+
+kB (335db8b, GPU1 RTX 3090): Triton bias+GELU (fwd 2.06x, fwd+bwd
+1.07x at [32,67,2048] bf16), qkv unbind/reshape copy elision, and
+torch.compile(mode=reduce-overhead) scoped to TransformerTemporal
+(PAN2_TEMPORAL_COMPILE=0 kills it). Temporal wall 11.04 -> 9.02 ms
+(-18.3%); ELEM_COPY profiler bucket 3.30 -> 1.86 ms (-43.6%). Numerics
+vs eager: fwd max|diff| 4e-6, grads 9.5e-5 (fp32 probes).
+
+End-to-end wall (60-step mean, same-session A/B):
+- GPU0: 10.93 (baseline) -> 8.72 (kA) -> 7.45 (kA+kB) ms/step,
+  -31.8% total; 91.5 -> 132 steps/s.
+- GPU1: 33.80 (baseline) -> 29.07 (kB) ms/step (-14.0%).
+
+Measurement caveats caught this round: (1) an intermediate "baseline"
+18.2/17.0 ms pair on GPU1 was a harness bug (model k=2 stacked on ring
+k=2 halved tokens to 33) discarded and re-measured at production wiring;
+(2) the earlier 30.9 ms 3090 figure did not reproduce same-session
+(33.8 baseline today) — drift ~3 ms across sessions, so only
+same-session A/B deltas are quoted as earned.
+
+Follow-up fix on main: save/load now strip/re-insert compile's
+._orig_mod. key segments so checkpoints round-trip between compiled
+and eager builds either direction (tests/test_ckpt_compile_compat.py).
