@@ -1,0 +1,40 @@
+# Production pack pretrain (full crawl corpus). Derived from the preview
+# config; dedicated ckpt_dir so --resume auto never picks up preview/leak-era
+# checkpoints. max_steps is a ceiling - set the real target at launch.
+# Deltas vs default.yaml, all intentional:
+# - frame_subsample 1: pack refs are 10fps native; stride is applied once at
+#   the data layer (constraint: applied exactly once), so the ring and the
+#   model both run k=1.
+# - horizons 10..150 native frames @10fps == the 1s..15s future-goal contract.
+model:
+  image_size: 64
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  context_len: 128
+  action_chunk: 10
+  n_discrete: 23
+  mouse_dim: 2
+  backbone: transformer
+  frame_subsample: 1
+  stem_channels: 32
+
+train:
+  stage: pretrain
+  batch_size: 64
+  lr: 0.0003
+  max_steps: 1000000
+  log_every: 50
+  ckpt_every: 500
+  num_workers: 4
+  device: cuda
+  bf16: true
+  synthetic: false
+  data_dir: /data/pan-2/shards
+  ckpt_dir: data/checkpoints/pack_pretrain
+  keep_uint8: true
+  compile: false
+  min_goal_horizon: 10
+  max_goal_horizon: 150
+  # wrong-horizon same-episode negatives (see gpu_pipeline.PipelineConfig)
+  n_hard_negatives: 4

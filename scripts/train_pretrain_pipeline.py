@@ -73,6 +73,17 @@ def main() -> None:
         else:
             print("resume auto: no checkpoint found, starting fresh")
 
+    # max_steps is the TOTAL step target: a resumed run finishes the
+    # remainder, and rerunning after completion exits fast before any
+    # producers spin up (idempotent for the wrapper's retry loop).
+    if state.step >= cfg.train.max_steps:
+        print(
+            f"already at step {state.step} >= max_steps {cfg.train.max_steps}, "
+            "nothing to do"
+        )
+        print("pretrain done")
+        return
+
     native_fps = args.native_fps
     if native_fps is None:
         native_fps = 10.0 if args.prefer_source == "pack" else 20.0
@@ -103,7 +114,7 @@ def main() -> None:
         while True:
             yield next(loader)
 
-    remaining = cfg.train.max_steps
+    remaining = cfg.train.max_steps - state.step
     try:
         while remaining > 0:
             chunk = min(cfg.train.log_every, remaining)
@@ -116,6 +127,9 @@ def main() -> None:
             remaining -= chunk
             if state.step % cfg.train.ckpt_every == 0:
                 save_ckpt(state, Path(cfg.train.ckpt_dir) / f"pretrain_step{state.step}.pt")
+        # Step-stamped final save even off the ckpt_every grid, so a
+        # rerun's --resume auto lands exactly here and exits fast.
+        save_ckpt(state, Path(cfg.train.ckpt_dir) / f"pretrain_step{state.step}.pt")
         save_ckpt(state, Path(cfg.train.ckpt_dir) / "pretrain_last.pt")
         print("pretrain done")
     finally:
