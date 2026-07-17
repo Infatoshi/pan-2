@@ -11,7 +11,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pan2.config import load_config
 from pan2.data.gpu_pipeline import PipelineConfig, PipelinedGpuPretrainLoader
-from pan2.train.loop import build_state, save_ckpt, train_steps
+from pan2.train.loop import build_state, load_ckpt, save_ckpt, train_steps
+
+
+def _latest_ckpt(ckpt_dir: Path) -> Path | None:
+    """Newest pretrain checkpoint by step number (pretrain_step*.pt)."""
+    best: tuple[int, Path] | None = None
+    for p in ckpt_dir.glob("pretrain_step*.pt"):
+        try:
+            step = int(p.stem.removeprefix("pretrain_step"))
+        except ValueError:
+            continue
+        if best is None or step > best[0]:
+            best = (step, p)
+    return best[1] if best else None
 
 
 def main() -> None:
@@ -32,7 +45,14 @@ def main() -> None:
                    help="source fps for seek/horizon units (default 10 for "
                         "pack, 20 otherwise)")
     p.add_argument("--max-steps", type=int, default=None,
-                   help="override config train.max_steps")
+                   help="override config train.max_steps (TOTAL steps incl. "
+                        "any resumed progress)")
+    p.add_argument("--refresh-prob", type=float, default=None,
+                   help="override ring slot refresh probability")
+    p.add_argument("--resume", default="", choices=["", "auto"],
+                   help="'auto': resume model+optim from the newest "
+                        "pretrain_step*.pt in ckpt_dir (freeze-tolerant "
+                        "relaunch; no-op when none exists)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -44,6 +64,14 @@ def main() -> None:
     cfg.model.frame_subsample = 1  # already_subsampled in ring
     state = build_state(cfg)
     cfg.model.frame_subsample = data_sub  # restore for pipeline config below
+
+    if args.resume == "auto":
+        ck = _latest_ckpt(Path(cfg.train.ckpt_dir))
+        if ck is not None:
+            load_ckpt(state, ck)
+            print(f"resumed from {ck} at step {state.step}")
+        else:
+            print("resume auto: no checkpoint found, starting fresh")
 
     native_fps = args.native_fps
     if native_fps is None:
@@ -62,10 +90,13 @@ def main() -> None:
         device=cfg.train.device,
         min_goal_horizon=cfg.train.min_goal_horizon,
         max_goal_horizon=cfg.train.max_goal_horizon,
+        n_hard_negatives=cfg.train.n_hard_negatives,
         native_fps=native_fps,
         pack_index=args.pack_index,
         pack_minecraft_only=args.pack_minecraft_only,
     )
+    if args.refresh_prob is not None:
+        pcfg.refresh_prob = args.refresh_prob
     loader = PipelinedGpuPretrainLoader(pcfg)
 
     def gen():

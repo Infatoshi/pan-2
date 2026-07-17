@@ -56,6 +56,9 @@ class TrainConfig:
     # same-episode hard negative as extra contrastive column (defeats scene-ID
     # shortcut). Disable for ablation.
     hard_negatives: bool = True
+    # negatives per row (pipeline/pack path). 1 = legacy single beyond-window
+    # neg; >1 = wrong-horizon negatives (see gpu_pipeline.PipelineConfig).
+    n_hard_negatives: int = 1
 
 
 @dataclass

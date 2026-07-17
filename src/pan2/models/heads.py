@@ -33,18 +33,21 @@ class GoalValueHead(nn.Module):
         neg_tok: torch.Tensor | None = None,
         temperature: float = 0.07,
     ) -> torch.Tensor:
-        """[B,D] state/goal (+optional [B,D] same-episode neg) -> [B,B(+1)] logits.
+        """[B,D] state/goal (+optional [B,D] or [B,K,D] same-episode negs)
+        -> [B, B(+K)] logits.
 
-        Row i's positive is column i. The optional final column is that row's
-        own hard negative, which defeats scene-ID shortcuts that cross-episode
-        in-batch negatives cannot.
+        Row i's positive is column i. Optional trailing columns are that row's
+        own hard negatives (same episode, wrong horizons), which defeat
+        scene-ID shortcuts that cross-episode in-batch negatives cannot.
         """
         s = self.encode_state(state_tok)
         g = self.encode_goal(goal_tok)
         out = (s @ g.T) / temperature
         if neg_tok is not None:
-            n = self.encode_goal(neg_tok)
-            own_neg = (s * n).sum(dim=-1, keepdim=True) / temperature
+            if neg_tok.dim() == 2:
+                neg_tok = neg_tok.unsqueeze(1)  # [B,1,D]
+            n = self.encode_goal(neg_tok)  # [B,K,D]
+            own_neg = torch.einsum("bd,bkd->bk", s, n) / temperature
             out = torch.cat([out, own_neg], dim=1)
         return out
 

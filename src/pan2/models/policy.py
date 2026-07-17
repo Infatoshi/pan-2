@@ -84,9 +84,21 @@ class PanPolicy(nn.Module):
         }
         neg_tok = None
         if neg is not None:
-            neg = prepare_images(neg, self.cfg.image_size)
-            neg_tok = self.encoder(neg)
-        out["contrastive_logits"] = self.value_head.logits(cond, out["goal_tok"], neg_tok)
+            # neg: [B,C,H,W] single hard negative, or [B,K,C,H,W] multi
+            # (wrong-horizon negatives); encode flattened, restore K.
+            if neg.dim() == 5:
+                bk = neg.shape[:2]
+                neg = prepare_images(neg.flatten(0, 1), self.cfg.image_size)
+                neg_tok = self.encoder(neg).view(*bk, -1)
+            else:
+                neg = prepare_images(neg, self.cfg.image_size)
+                neg_tok = self.encoder(neg)
+        # Contrastive state side MUST be `state` (last context position, -2):
+        # it is causally blind to the goal token at -1. `cond` attends to the
+        # goal itself, so scoring cond against goal_proj lets the model match
+        # goal identity through the residual stream and InfoNCE collapses to
+        # ~0 without learning dynamics (observed: 0.0005 floor by 25k steps).
+        out["contrastive_logits"] = self.value_head.logits(state, out["goal_tok"], neg_tok)
         if return_actions:
             disc, mouse = self.action_head(cond)
             out["discrete_logits"] = disc

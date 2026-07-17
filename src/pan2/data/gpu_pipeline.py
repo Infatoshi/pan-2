@@ -16,6 +16,7 @@ from __future__ import annotations
 import queue
 import random
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -52,6 +53,12 @@ class PipelineConfig:
     # (20Hz): defaults 1s..15s into the future
     min_goal_horizon: int = 20
     max_goal_horizon: int = 300
+    # same-episode hard negatives per row. 1 keeps the legacy layout (one
+    # frame strictly beyond the goal window). >1 switches to wrong-horizon
+    # negatives: frames from [1, 2*max_goal_horizon] after context end whose
+    # horizon differs from the goal's by >= min_goal_horizon, forcing the
+    # model to bind the goal to WHEN it happens, not just which episode.
+    n_hard_negatives: int = 1
     # recycle a used slot with this probability so producers keep refilling
     # fresh clips/goals instead of serving a frozen capacity-sized subset.
     # Measured 2026-07-15 (shard source, 9950X3D): producers sustain ~690
@@ -66,6 +73,10 @@ class PipelineConfig:
     out_dtype: torch.dtype = torch.bfloat16
     # ffmpeg binary
     ffmpeg: str = "ffmpeg"
+    # niceness for producer decode subprocesses. The training thread competes
+    # with its own ffmpeg fleet for CPU; deprioritizing decode keeps kernel
+    # launches on-core (decode has ring-buffer slack to absorb it).
+    decode_nice: int = 10
 
 
 def _subsample_indices(t: int, k: int) -> list[int]:
@@ -162,6 +173,7 @@ def _decode_mp4_window(
     ffmpeg: str = "ffmpeg",
     fps: float = 20.0,
     scale: bool = True,
+    nice: int = 0,
 ) -> np.ndarray:
     """Decode a contiguous window to uint8 NHWC RGB via ffmpeg.
 
@@ -171,7 +183,10 @@ def _decode_mp4_window(
     the pack ref64 layout), maximizing decode throughput.
     """
     ss = max(0.0, start_frame / fps)
-    cmd = [
+    cmd = []
+    if nice > 0:
+        cmd += ["nice", "-n", str(nice)]
+    cmd += [
         ffmpeg,
         "-v",
         "error",
@@ -185,14 +200,31 @@ def _decode_mp4_window(
     if scale:
         cmd += ["-vf", f"scale={image_size}:{image_size}"]
     cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     need = num_frames * image_size * image_size * 3
-    if proc.returncode != 0 or len(proc.stdout) < need:
-        raise RuntimeError(
-            f"ffmpeg failed {mp4.name} rc={proc.returncode} "
-            f"got={len(proc.stdout)} need={need} err={proc.stderr[-200:]!r}"
-        )
-    arr = np.frombuffer(proc.stdout[:need], dtype=np.uint8)
+    # Unbuffered Popen + readinto instead of subprocess.run: run() drains the
+    # pipe in ~32KB Python-loop chunks holding the GIL (~14% of wall measured
+    # via py-spy --gil, 2026-07-17); raw readinto releases the GIL for the
+    # whole read(2). stderr spools to a file so it can never backpressure.
+    buf = bytearray(need)
+    view = memoryview(buf)
+    with tempfile.TemporaryFile(dir="/dev/shm" if Path("/dev/shm").is_dir() else None) as errf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, bufsize=0)
+        got = 0
+        assert proc.stdout is not None
+        while got < need:
+            n = proc.stdout.readinto(view[got:])
+            if not n:
+                break
+            got += n
+        proc.stdout.close()
+        rc = proc.wait()
+        if rc != 0 or got < need:
+            errf.seek(0)
+            err = errf.read()[-200:]
+            raise RuntimeError(
+                f"ffmpeg failed {mp4.name} rc={rc} got={got} need={need} err={err!r}"
+            )
+    arr = np.frombuffer(buf, dtype=np.uint8)
     return arr.reshape(num_frames, image_size, image_size, 3)
 
 
@@ -239,8 +271,22 @@ class _Producer(threading.Thread):
         t_full = self.cfg.context_len
         k = self.cfg.frame_subsample
         idxs = _subsample_indices(t_full, k)
-        # slot layout: [0:t_sub] context tokens, then future-goal, then hard neg
-        assert len(idxs) + 2 == self.ring.t_sub
+        # slot layout: [0:t_sub] context tokens, then future-goal, then negs
+        assert len(idxs) + 1 + self.cfg.n_hard_negatives == self.ring.t_sub
+        # One reusable pinned staging buffer per producer. Allocating pinned
+        # memory per clip (cudaHostAlloc) and freeing it (cudaFreeHost)
+        # device-synchronizes; at ~5 fills/step that stalled the training
+        # stream ~2x (44.8 -> 21.2 ms/step with producers quiesced, GPU0
+        # 2026-07-17). publish() synchronizes its copy stream before
+        # returning, so the buffer is safe to overwrite on the next fill.
+        self._staging = torch.empty(
+            self.ring.t_sub,
+            3,
+            self.cfg.image_size,
+            self.cfg.image_size,
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
 
         while not self.stop_evt.is_set():
             slot = self.ring.acquire_free(timeout=0.2)
@@ -297,18 +343,54 @@ class _Producer(threading.Thread):
                 ffmpeg=self.cfg.ffmpeg,
                 fps=self.cfg.native_fps,
                 scale=int(item.get("native_size", 0)) != self.cfg.image_size,
+                nice=self.cfg.decode_nice,
             )
         horizon = self.rng.randint(self.cfg.min_goal_horizon, self.cfg.max_goal_horizon)
-        goal = window[t_full - 1 + horizon]  # strictly after context end
-        # hard negative: same episode, strictly beyond the goal window
-        neg_off = self.rng.randint(1, self.cfg.max_goal_horizon)
-        neg = window[t_full - 1 + self.cfg.max_goal_horizon + neg_off]
-        # NHWC -> NCHW uint8 pinned; layout [ctx toks | goal | neg]
+        neg_horizons = self._sample_neg_horizons(horizon)
+        # NHWC -> NCHW straight into the reusable pinned staging buffer;
+        # layout [ctx toks | goal | negs...]
+        t_ctx = len(idxs)
+        out = self._staging
         thwc = torch.from_numpy(np.ascontiguousarray(window[idxs]))  # T,H,W,C
-        nchw = thwc.permute(0, 3, 1, 2).contiguous()
-        goal_t = torch.from_numpy(goal.transpose(2, 0, 1).copy())
-        neg_t = torch.from_numpy(neg.transpose(2, 0, 1).copy())
-        return torch.cat([nchw, goal_t.unsqueeze(0), neg_t.unsqueeze(0)]).pin_memory()
+        out[:t_ctx].copy_(thwc.permute(0, 3, 1, 2))
+        # .copy(): mp4 windows come from a read-only frombuffer view
+        goal = torch.from_numpy(window[t_full - 1 + horizon].copy())  # H,W,C
+        out[t_ctx].copy_(goal.permute(2, 0, 1))
+        for j, h in enumerate(neg_horizons):
+            n = torch.from_numpy(window[t_full - 1 + h].copy())
+            out[t_ctx + 1 + j].copy_(n.permute(2, 0, 1))
+        return out
+
+    def _sample_neg_horizons(self, goal_horizon: int) -> list[int]:
+        """Horizons for same-episode negatives, all within the loaded window.
+
+        K=1 keeps the legacy scheme (strictly beyond the goal window). K>1
+        draws wrong-horizon frames from [1, 2*max_goal_horizon] whose horizon
+        differs from the goal's by >= min_goal_horizon (and pairwise by
+        >= min separation where possible), so negatives include both
+        too-early and too-late futures of the SAME episode.
+        """
+        cfg = self.cfg
+        k = max(1, cfg.n_hard_negatives)
+        if k == 1:
+            off = self.rng.randint(1, cfg.max_goal_horizon)
+            return [cfg.max_goal_horizon + off]
+        margin = max(1, cfg.min_goal_horizon)
+        chosen: list[int] = []
+        tries = 0
+        while len(chosen) < k and tries < 200:
+            tries += 1
+            h = self.rng.randint(1, 2 * cfg.max_goal_horizon)
+            if abs(h - goal_horizon) < margin:
+                continue
+            if any(abs(h - c) < margin for c in chosen):
+                continue
+            chosen.append(h)
+        while len(chosen) < k:  # degenerate margins: fill without pairwise rule
+            h = self.rng.randint(1, 2 * cfg.max_goal_horizon)
+            if abs(h - goal_horizon) >= margin:
+                chosen.append(h)
+        return chosen
 
 
 class PipelinedGpuPretrainLoader:
@@ -334,7 +416,8 @@ class PipelinedGpuPretrainLoader:
             )
 
         idxs = _subsample_indices(cfg.context_len, cfg.frame_subsample)
-        t_slot = len(idxs) + 2  # +1 future-goal frame, +1 hard-negative frame
+        # +1 future-goal frame, +K hard-negative frames
+        t_slot = len(idxs) + 1 + max(1, cfg.n_hard_negatives)
         bytes_per_clip = t_slot * 3 * cfg.image_size * cfg.image_size  # uint8
         capacity = max(64, int(cfg.budget_gb * (1024**3) // bytes_per_clip))
         # leave headroom if device has less free memory
@@ -546,11 +629,16 @@ class PipelinedGpuPretrainLoader:
         # shape); falls back to the torch reference composition off-CUDA.
         slot_t = torch.tensor(slots, device=self.device, dtype=torch.long)
         t_slot = self.ring.frames.shape[1]
+        k_neg = max(1, self.cfg.n_hard_negatives)
+        t_ctx = t_slot - 1 - k_neg
         ctx, tail = kernels.get("gather_cast")(
-            self.ring.frames, slot_t, 1.0 / 255.0, self.cfg.out_dtype, t_slot - 2
+            self.ring.frames, slot_t, 1.0 / 255.0, self.cfg.out_dtype, t_ctx
         )
-        ctx = ctx.view(bs, t_slot - 2, *ctx.shape[1:])
-        goal, neg = tail.view(bs, 2, *tail.shape[1:]).unbind(1)
+        ctx = ctx.view(bs, t_ctx, *ctx.shape[1:])
+        tail = tail.view(bs, 1 + k_neg, *tail.shape[1:])
+        goal = tail[:, 0]
+        # single neg keeps the legacy [B,C,H,W] contract; K>1 emits [B,K,...]
+        neg = tail[:, 1] if k_neg == 1 else tail[:, 1:]
 
         # refresh a few used slots so producers keep cycling fresh clips/goals
         for s in slots:

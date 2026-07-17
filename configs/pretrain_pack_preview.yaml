@@ -34,3 +34,5 @@ train:
   compile: false
   min_goal_horizon: 10
   max_goal_horizon: 150
+  # wrong-horizon same-episode negatives (see gpu_pipeline.PipelineConfig)
+  n_hard_negatives: 4
