@@ -898,3 +898,85 @@ the open question; negative hardness is.
 
 Meanwhile ref64 kept growing during the run (2,164 at launch, 3,203
 after) with 128px at 7,609/9,733; full-corpus ETA still morning.
+
+## 2026-07-17 (overnight) - Goal-leak fix, wrong-horizon negatives, 1.6x step
+
+Overnight autopilot before the real pretrain. Four workstreams, all
+measured on GPU0 with the ref64 transcode fleet co-running.
+
+1. CONTRASTIVE GOAL LEAK (the real reason InfoNCE hit 0.0005). The
+value head scored `cond` (temporal output at the GOAL position, which
+attends to the goal token) against goal_proj(goal_tok) - the model
+could match goal identity through the residual stream without learning
+any dynamics. `state` (last context position, -2) is causally blind to
+the goal and was already computed. Fix: logits(state, goal). Regression
+test asserts bitwise goal-blindness of the state side. With the fix the
+task is real: loss starts at chance ln(B+K) ~ 4.2 and grinds to ~1.2 by
+3k steps (was: 0.05 by step 300). The 100k preview checkpoints learned
+the shortcut and are NOT usable for the real pretrain.
+
+2. WRONG-HORIZON NEGATIVES (n_hard_negatives, default 1 = legacy).
+K>1 draws same-episode frames at horizons in [1, 2*max_h] differing
+from the goal horizon by >= min_h (too-early AND too-late futures), so
+the model must bind WHEN, not just which-episode. Slot layout is now
+[ctx | goal | negK]; head takes [B,K,D] negs -> [B,B+K] logits; single
+neg keeps the legacy [B,D] contract. Pack config runs K=4.
+
+3. STEP TIME 46.4 -> 29.4 ms (1.6x) at bs64/T128/K=4, 12 producers.
+py-spy --gil showed 91% GIL occupancy: Triton JITFunction.run launch
+glue + clip_grad_norm_ (14.5%) on the main thread, subprocess.run pipe
+drain (14%) in producers. Measured ladder, 400-step runs, steps 100-400:
+  46.4  baseline (staging-pool pinned buffers landed first: the
+        per-fill pin_memory()/cudaHostAlloc churn theory was WRONG -
+        no step change - but the pool stays, it is strictly less work)
+  38.4  + PAN2_TEMPORAL_COMPILE_MODE=reduce-overhead (cudagraph trees
+        now buy 8 ms under GIL contention, not the 0.34 ms of the
+        quiet bs32 bench; launcher exports it, code default unchanged)
+  31.4  + Popen/readinto decode (raw read(2) releases the GIL; stderr
+        spools to /dev/shm so it cannot backpressure)
+  29.4  + fused grad clip: global-norm clip folded into FusedAdamW as
+        a second pointer-table pass (atomic sum of g*g) + scale inside
+        the update kernel; no host sync, grads untouched. Parity tests
+        vs clip_grad_norm_+torch fused AdamW (1e-5); isolated bench
+        0.86 -> 0.67 ms. grad_clip=0 is NOT a shortcut: one 400-step
+        run collapsed to uniform logits (loss pinned at ln68) without
+        clipping.
+  Whole-model reduce-overhead compile: no further win (~31 ms, K=1) -
+  dynamo graph breaks at the custom autograd Functions keep the
+  encoder out of capture. Producers-stopped floor is 21 ms; the last
+  ~8 ms is producer GIL, a v2 producer-process isolation item.
+  At 29.4 ms/step: ~7.9 h-video/s ingest, 100k steps in ~49 min.
+
+4. FREEZE TOLERANCE (crash forensics verdict: hardware, likely
+marginal DRAM/IMC - Jun 23 slab GPF was a single-bit flip signature,
+Jul 16 freeze left zero trace, CF9 manual reset at 20:06; do not trust
+unattended multi-day runs yet). scripts/run_pack_pretrain.sh: index
+rebuild + retry loop + `--resume auto` (newest pretrain_step*.pt),
+dedicated ckpt_dir data/checkpoints/pack_pretrain via
+configs/pretrain_pack.yaml so it can never resume leak-era previews.
+Recommended to the user (not applied): memtest under load, hardware
+watchdog, rasdaemon, kdump/pstore.
+Validation exposed and fixed two resume-semantics bugs: --max-steps was
+consumed as ADDITIONAL steps after resume (now an absolute total: a
+resumed run finishes the remainder, an already-done run exits before
+producers spin up), and the final checkpoint was only saved as
+pretrain_last.pt when max_steps missed the ckpt_every grid, so a rerun
+resumed from an older step-stamped ckpt and retrained (now the final
+save is always step-stamped too). End-to-end validated on GPU0:
+1500-step leg, crash-style resume 1500 -> 2500 -> 4000 -> 4300, then an
+idempotent rerun that resumed at 4300 and exited rc=0 in 3s. err=0 and
+~30 ms/step throughout; loss 4.2 -> 0.5 by 4k steps.
+
+5. CODEC FINE-DETAIL PROBE (scripts/probe_codec_negatives.py). Question:
+does crf28@64px blur away the differences wrong-horizon negatives rely
+on? Measured on 12 random raw/ref64 stem pairs, 240 frames each: full
+pipeline codec error (ref64 vs raw->fps10->lanczos64) is 7.5 RMS in
+uint8 units, while temporal separation between clean frames is 45.3 RMS
+at the minimum negative horizon h=10 (ratio 0.17), rising to 69-83 RMS
+at h=50-150 (ratio ~0.1). Worst stem (static menu-ish video) is still
+0.29 at h=10. Negatives sit 6-11x above the codec noise floor: crf28 is
+fine, no re-encode needed. Only h=1 approaches the floor (ratio 0.36
+mean, ~0.9 worst) and h<min_h is never sampled as a negative.
+
+Tests 93+ passing (goal-blindness, multi-neg sampler/layout/head/policy,
+fused-clip parity x3), ruff clean.
