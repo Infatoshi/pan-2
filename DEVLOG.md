@@ -869,3 +869,32 @@ Lessons:
 Next: tonight's preview run (rebuild index over the grown ref64 set
 ~21:00, 100k steps ~90 min on GPU0); topic queue stays: wrong-horizon
 negatives, cross-episode goals, fine-detail codec probes.
+
+## 2026-07-16 (night) - 100k-step pack preview: clean, 4.92 h/s
+
+Context: anvil hard-crashed ~20:07 (journal ends 18:38 with no
+shutdown trace, no panic captured; 9 days uptime lost). Both transcode
+fleets relaunched post-crash, zero fails on either after restart (the
+ref64 exact-equality gate would have flagged truncated pre-crash
+mkvs; none surfaced). The 22:17 scheduled launch died with its
+session; resumed session launched manually via the committed
+scripts/run_pack_preview.sh under an overnight-compute gpu0 lease.
+
+Run (bs64, ctx128@10fps, 12 producers, index rebuilt at launch over
+2,214 episodes / ~940h): 100,000 steps in 78.3 min = 47.0 ms/step =
+4.92 h-video/s, now BEATING the 4.80 shard-path number (the pm run's
+4.44 was depressed by heavier co-running encode CPU, as suspected).
+326,149 fills, errors=0, zero starvation lines, ring pinned near
+6,713/6,721 the whole run. Loss 1.14 -> 0.0055 @10k -> ~0.0005 floor
+by 25k, occasional 0.01-0.05 spikes after. Checkpoints every 500
+steps to data/checkpoints (through pretrain_step99500.pt). Lease
+acquired 21:38, released clean (status done) 22:59.
+
+Read on the loss floor: InfoNCE saturates by ~25k steps on this
+corpus slice - the pretext task is too easy at this scale, which is
+the existing topic queue in numbers (wrong-horizon negatives,
+cross-episode goals). Throughput and the pack layout are no longer
+the open question; negative hardness is.
+
+Meanwhile ref64 kept growing during the run (2,164 at launch, 3,203
+after) with 128px at 7,609/9,733; full-corpus ETA still morning.
