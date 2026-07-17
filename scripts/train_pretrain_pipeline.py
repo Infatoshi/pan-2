@@ -31,9 +31,13 @@ def main() -> None:
     p.add_argument("--native-fps", type=float, default=None,
                    help="source fps for seek/horizon units (default 10 for "
                         "pack, 20 otherwise)")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="override config train.max_steps")
     args = p.parse_args()
 
     cfg = load_config(args.config)
+    if args.max_steps is not None:
+        cfg.train.max_steps = args.max_steps
     cfg.train.stage = "pretrain"
     cfg.train.synthetic = False
     data_sub = cfg.model.frame_subsample
