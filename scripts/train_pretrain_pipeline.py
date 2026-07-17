@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -11,7 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pan2.config import load_config
 from pan2.data.gpu_pipeline import PipelineConfig, PipelinedGpuPretrainLoader
-from pan2.train.loop import build_state, load_ckpt, save_ckpt, train_steps
+from pan2.train.loop import (
+    build_state,
+    eval_contrastive,
+    load_ckpt,
+    save_ckpt,
+    train_steps,
+)
 
 
 def _latest_ckpt(ckpt_dir: Path) -> Path | None:
@@ -25,6 +32,11 @@ def _latest_ckpt(ckpt_dir: Path) -> Path | None:
         if best is None or step > best[0]:
             best = (step, p)
     return best[1] if best else None
+
+
+def gen_val(val_loader: PipelinedGpuPretrainLoader):
+    while True:
+        yield next(val_loader)
 
 
 def main() -> None:
@@ -108,7 +120,26 @@ def main() -> None:
     )
     if args.refresh_prob is not None:
         pcfg.refresh_prob = args.refresh_prob
+    pcfg.heldout_frac = cfg.train.heldout_frac
     loader = PipelinedGpuPretrainLoader(pcfg)
+
+    # Held-out val loader: same episode hash split, frozen ring (refresh=0)
+    # so every checkpoint scores the same windows. Small budget is fine - it
+    # only refills once at startup.
+    val_loader = None
+    if cfg.train.eval_every > 0 and cfg.train.heldout_frac > 0:
+        vpcfg = dataclasses.replace(
+            pcfg,
+            split="val",
+            budget_gb=0.3,
+            num_producers=2,
+            refresh_prob=0.0,
+        )
+        val_loader = PipelinedGpuPretrainLoader(vpcfg)
+        print(
+            f"[eval] held-out pool={len(val_loader.items)} episodes, "
+            f"{cfg.train.eval_batches} batches every {cfg.train.eval_every} steps"
+        )
 
     def gen():
         while True:
@@ -125,15 +156,31 @@ def main() -> None:
                 f"ring={st['ready']}/{st['capacity']} fills={st['fills']} err={st['errors']}"
             )
             remaining -= chunk
+            if val_loader is not None and state.step % cfg.train.eval_every == 0:
+                ev = eval_contrastive(state, cfg, gen_val(val_loader), cfg.train.eval_batches)
+                chance = 1.0 / (cfg.train.batch_size + cfg.train.n_hard_negatives)
+                print(
+                    f"eval step={state.step} val_loss={ev['val_loss']:.4f} "
+                    f"val_acc={ev['val_acc']:.4f} (chance={chance:.4f})"
+                )
             if state.step % cfg.train.ckpt_every == 0:
                 save_ckpt(state, Path(cfg.train.ckpt_dir) / f"pretrain_step{state.step}.pt")
         # Step-stamped final save even off the ckpt_every grid, so a
         # rerun's --resume auto lands exactly here and exits fast.
+        if val_loader is not None:
+            ev = eval_contrastive(state, cfg, gen_val(val_loader), cfg.train.eval_batches)
+            chance = 1.0 / (cfg.train.batch_size + cfg.train.n_hard_negatives)
+            print(
+                f"eval step={state.step} val_loss={ev['val_loss']:.4f} "
+                f"val_acc={ev['val_acc']:.4f} (chance={chance:.4f}) [final]"
+            )
         save_ckpt(state, Path(cfg.train.ckpt_dir) / f"pretrain_step{state.step}.pt")
         save_ckpt(state, Path(cfg.train.ckpt_dir) / "pretrain_last.pt")
         print("pretrain done")
     finally:
         loader.stop()
+        if val_loader is not None:
+            val_loader.stop()
 
 
 if __name__ == "__main__":

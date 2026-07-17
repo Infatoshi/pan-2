@@ -38,3 +38,9 @@ train:
   max_goal_horizon: 150
   # wrong-horizon same-episode negatives (see gpu_pipeline.PipelineConfig)
   n_hard_negatives: 4
+  # held-out validation (SPEC success criterion 3): 2% of episodes by stem
+  # hash (~194 episodes / ~84h at 9.7k corpus), scored every 500 steps with
+  # 32 batches; retrieval accuracy chance level = 1/(64+4) = 0.0147
+  heldout_frac: 0.02
+  eval_every: 500
+  eval_batches: 32

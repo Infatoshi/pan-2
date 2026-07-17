@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +78,41 @@ class PipelineConfig:
     # with its own ffmpeg fleet for CPU; deprioritizing decode keeps kernel
     # launches on-core (decode has ring-buffer slack to absorb it).
     decode_nice: int = 10
+    # stem-hash held-out split for per-checkpoint validation (SPEC success
+    # criterion 3: "contrastive accuracy >> chance on REAL held-out clips").
+    # Split by EPISODE stem, never by window: adjacent windows of one episode
+    # in train and val would leak. heldout_frac=0 disables. split="train"
+    # excludes held-out episodes; "val" keeps only them.
+    heldout_frac: float = 0.0
+    split: str = "train"
+
+
+def _is_heldout(stem: str, frac: float) -> bool:
+    """Deterministic episode-level membership in the held-out set.
+
+    crc32 is stable across processes and machines, so every relaunch (incl.
+    freeze-resume) sees the same split without a manifest file.
+    """
+    return (zlib.crc32(stem.encode()) % 10_000) / 10_000 < frac
+
+
+def apply_split(items: list[dict], frac: float, split: str) -> list[dict]:
+    """Filter discovered items by the held-out stem hash (see PipelineConfig)."""
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+    if not 0.0 <= frac < 1.0:
+        raise ValueError(f"heldout_frac must be in [0, 1), got {frac}")
+    if split == "val" and frac <= 0.0:
+        raise ValueError("split='val' needs heldout_frac > 0")
+    if frac <= 0.0:
+        return items
+    keep_val = split == "val"
+    out = [it for it in items if _is_heldout(it["stem"], frac) == keep_val]
+    if not out:
+        raise FileNotFoundError(
+            f"split={split!r} with heldout_frac={frac} matched no episodes"
+        )
+    return out
 
 
 def _subsample_indices(t: int, k: int) -> list[int]:
@@ -408,11 +444,14 @@ class PipelinedGpuPretrainLoader:
         self.device = torch.device(cfg.device)
         self.rng = random.Random(cfg.seed)
 
-        self.items = self._discover_items()
+        self.items = apply_split(
+            self._discover_items(), cfg.heldout_frac, cfg.split
+        )
         if not self.items:
             raise FileNotFoundError(
                 f"no clips under raw={cfg.raw_dir} episodes={cfg.episodes_dir} "
-                f"shards={cfg.shards_dir}"
+                f"shards={cfg.shards_dir} pack_index={cfg.pack_index} "
+                f"(split={cfg.split} heldout_frac={cfg.heldout_frac})"
             )
 
         idxs = _subsample_indices(cfg.context_len, cfg.frame_subsample)

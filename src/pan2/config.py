@@ -59,6 +59,12 @@ class TrainConfig:
     # negatives per row (pipeline/pack path). 1 = legacy single beyond-window
     # neg; >1 = wrong-horizon negatives (see gpu_pipeline.PipelineConfig).
     n_hard_negatives: int = 1
+    # episode-level held-out validation (pipeline loader). 0 disables.
+    heldout_frac: float = 0.0
+    # eval cadence in steps (0 disables); each eval runs eval_batches val
+    # batches and logs val_loss + val top-1 retrieval accuracy.
+    eval_every: int = 0
+    eval_batches: int = 32
 
 
 @dataclass

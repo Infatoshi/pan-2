@@ -980,3 +980,39 @@ mean, ~0.9 worst) and h<min_h is never sampled as a negative.
 
 Tests 93+ passing (goal-blindness, multi-neg sampler/layout/head/policy,
 fused-clip parity x3), ruff clean.
+
+## 2026-07-17 (afternoon) - Held-out per-checkpoint eval + full-corpus index
+
+Morning preflight (owed by the limited session): ref64 fleet drained at
+9,730/9,733 (3 raw stragglers never transcoded, zero failures logged),
+pack index rebuilt over the full corpus: 9,724 episodes / 152.4M frames /
+4,234 h / 31.5 GB (6 probe-failure drops). meta_coverage 1.0, minecraft
+fraction 0.616. First rebuild passed a wrong meta path
+(data/crawl/meta/list.tsv does not exist; the real one is
+data/crawl/state/meta/list.tsv, what both launchers use) and got
+minecraft=0 silently - load_meta swallows a missing meta file into an
+empty dict. Caught by comparing against the previous index's 0.617.
+
+HELD-OUT EVAL (closes SPEC success criterion 3 tooling). Until now the
+pipeline logged only training-stream loss; contrastive_accuracy existed
+unwired. That is exactly how the goal-leak survived a 100k-step preview.
+Now: episode-level held-out split by stem crc32 (deterministic across
+processes, no manifest), PipelineConfig.heldout_frac + split="train"|"val"
+(apply_split), train.heldout_frac/eval_every/eval_batches config knobs,
+loop.eval_contrastive (no-grad, restores train mode), and a frozen val
+loader (refresh_prob=0: every checkpoint scores the same windows) in
+train_pretrain_pipeline.py. Split by EPISODE stem, not window - adjacent
+windows of one episode in both sets would leak. Metrics: val_loss +
+top-1 retrieval accuracy over [B, B+K], chance = 1/(64+4) = 0.0147.
+pretrain_pack.yaml: 2% held out (~196 episodes / ~84h), 32 batches every
+500 steps (aligns with ckpt cadence; eval slots to log_every chunk
+boundaries, so keep eval_every a multiple of 50). Smoke (GPU1, K=4,
+reduce-overhead compile ON incl. eval-mode pass): train items 9,528 +
+val 196 == 9,724, err=0, at step 70 val_acc 0.0449 = 3x chance already.
+Known v0 limits: the val window subset is re-drawn per process (producer
+rng is id-seeded), so a freeze-resume shifts the val sample within the
+same 196 episodes - fine for trend, not for bitwise ckpt comparison.
+100 tests passing (7 new: hash determinism/disjointness/
+arg-validation/empty-val/eval plumbing), ruff clean. Checkpoint
+selection stays manual (log-only eval); horizon-gap-binned accuracy is
+the v2 metric for wrong-horizon discrimination.

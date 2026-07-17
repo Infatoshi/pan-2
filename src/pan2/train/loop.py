@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from pan2.config import Config
+from pan2.eval.metrics import contrastive_accuracy
 from pan2.kernels.fused_adamw import build_adamw
 from pan2.models.policy import PanPolicy
 from pan2.train.losses import action_loss, contrastive_loss
@@ -121,6 +122,35 @@ def train_steps(
         metrics["step"] = float(state.step)
         logs.append(metrics)
     return logs
+
+
+def eval_contrastive(
+    state: TrainState,
+    cfg: Config,
+    batches: Iterator[dict[str, torch.Tensor]],
+    n_batches: int,
+) -> dict[str, float]:
+    """Held-out pretrain metric: mean contrastive loss + top-1 retrieval acc.
+
+    Accuracy is over the [B, B+K] logit matrix (positive at the diagonal);
+    chance = 1/(B+K). No grads, model returned to train mode after.
+    """
+    was_training = state.model.training
+    state.model.eval()
+    tot_loss = 0.0
+    tot_acc = 0.0
+    with torch.no_grad(), _autocast(state.device, cfg.train.bf16):
+        for _ in range(n_batches):
+            batch = next(batches)
+            batch = {k: v.to(state.device, non_blocking=True) for k, v in batch.items()}
+            neg = batch.get("neg") if cfg.train.hard_negatives else None
+            out = state.model(batch["frames"], batch["goal"], neg, return_actions=False)
+            loss = contrastive_loss(out["contrastive_logits"])
+            tot_loss += float(loss)
+            tot_acc += contrastive_accuracy(out["contrastive_logits"])
+    if was_training:
+        state.model.train()
+    return {"val_loss": tot_loss / n_batches, "val_acc": tot_acc / n_batches}
 
 
 def infinite_loader(loader: DataLoader) -> Iterator[dict[str, torch.Tensor]]:
