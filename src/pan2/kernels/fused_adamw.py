@@ -40,6 +40,17 @@ except ImportError:  # pragma: no cover
 _BLOCK = 1024
 
 
+def grad_clip_scale_ref(grads: list[torch.Tensor], max_norm: float) -> torch.Tensor:
+    """Global-norm clip factor, matching torch clip_grad_norm_ semantics:
+    scale = min(1, max_norm / (||g||_2 + 1e-6)). Returns a 0-dim fp32 tensor."""
+    device = grads[0].device
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    for g in grads:
+        total += g.float().pow(2).sum()
+    norm = total.sqrt()
+    return torch.clamp(max_norm / (norm + 1e-6), max=1.0)
+
+
 def adamw_step_ref(
     params: list[torch.Tensor],
     grads: list[torch.Tensor],
@@ -52,13 +63,24 @@ def adamw_step_ref(
     beta2: float,
     weight_decay: float,
     eps: float,
+    clip_max_norm: float = 0.0,
 ) -> None:
-    """Pure-torch AdamW step (decoupled WD), matching fused semantics."""
+    """Pure-torch AdamW step (decoupled WD), matching fused semantics.
+
+    clip_max_norm > 0 folds global-norm gradient clipping into the update
+    (equivalent to clip_grad_norm_(max_norm) before the step; grads are NOT
+    mutated in place).
+    """
     if not params:
         return
+    scale = None
+    if clip_max_norm > 0.0:
+        scale = grad_clip_scale_ref(grads, clip_max_norm)
     for p, g, m, v, step_t in zip(
         params, grads, exp_avgs, exp_avg_sqs, state_steps, strict=True
     ):
+        if scale is not None:
+            g = g * scale
         step_t.add_(1)
         step = float(step_t.item())
         bias_correction1 = 1.0 - beta1**step
@@ -77,6 +99,25 @@ def adamw_step_ref(
 if _TRITON_OK:
 
     @triton.jit
+    def _grad_sqsum_ptr_table_kernel(
+        g_ptrs,  # int64* [n_tensors]
+        numels,  # int64* [n_tensors]
+        work_tid,  # int32* [n_work]
+        work_off,  # int64* [n_work]
+        acc_ptr,  # fp32* scalar accumulator (pre-zeroed)
+        BLOCK: tl.constexpr,
+    ):
+        wid = tl.program_id(0)
+        tid = tl.load(work_tid + wid)
+        start = tl.load(work_off + wid)
+        n = tl.load(numels + tid)
+        g_ptr = tl.load(g_ptrs + tid).to(tl.pointer_type(tl.float32))
+        idx = start + tl.arange(0, BLOCK)
+        mask = idx < n
+        g = tl.load(g_ptr + idx, mask=mask, other=0.0)
+        tl.atomic_add(acc_ptr, tl.sum(g * g))
+
+    @triton.jit
     def _adamw_ptr_table_kernel(
         p_ptrs,  # int64* [n_tensors]
         g_ptrs,
@@ -86,11 +127,14 @@ if _TRITON_OK:
         work_tid,  # int32* [n_work] tensor index per program
         work_off,  # int64* [n_work] element offset into that tensor
         step_ptr,  # fp32* scalar (already incremented)
+        sqsum_ptr,  # fp32* scalar sum of squared grad norms (unused if no clip)
         lr,
         beta1,
         beta2,
         weight_decay,
         eps,
+        clip_max_norm,
+        CLIP: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         wid = tl.program_id(0)
@@ -119,6 +163,11 @@ if _TRITON_OK:
         g = tl.load(g_ptr + idx, mask=mask, other=0.0)
         m = tl.load(m_ptr + idx, mask=mask, other=0.0)
         v = tl.load(v_ptr + idx, mask=mask, other=0.0)
+
+        if CLIP:
+            # global-norm clip folded in: scale = min(1, max/(||g||+1e-6))
+            norm = tl.sqrt(tl.load(sqsum_ptr))
+            g = g * tl.minimum(1.0, clip_max_norm / (norm + 1e-6))
 
         # ADAMW: p -= lr * wd * p
         p = p - lr_wd * p
@@ -154,6 +203,7 @@ if _TRITON_OK:
         beta2: float,
         weight_decay: float,
         eps: float,
+        clip_max_norm: float = 0.0,
         block: int = _BLOCK,
         cache: dict[str, Any] | None = None,
     ) -> None:
@@ -162,6 +212,10 @@ if _TRITON_OK:
         If `cache` is provided (mutable dict owned by the optimizer), stable
         tables (p/m/v ptrs, numels, work lists) are rebuilt only when the
         param set identity changes; only grad pointers refresh every step.
+
+        clip_max_norm > 0 adds one pointer-table pass computing sum(g*g)
+        (atomic accumulate) and applies the global-norm clip factor inside
+        the update kernel - no host sync, grads untouched in memory.
         """
         n = len(params)
         if n == 0:
@@ -231,6 +285,26 @@ if _TRITON_OK:
         step_ptr = state_steps[0]
 
         grid = (n_work,)
+        clip = clip_max_norm > 0.0
+        if clip:
+            if cache is not None and "sqsum" in cache:
+                sqsum = cache["sqsum"]
+            else:
+                sqsum = torch.zeros((), dtype=torch.float32, device=device)
+                if cache is not None:
+                    cache["sqsum"] = sqsum
+            sqsum.zero_()
+            _grad_sqsum_ptr_table_kernel[grid](
+                g_ptrs,
+                numels_t,
+                work_tid,
+                work_off,
+                sqsum,
+                BLOCK=block,
+                num_warps=8,
+            )
+        else:
+            sqsum = step_ptr  # unused placeholder, must be a valid pointer
         _adamw_ptr_table_kernel[grid](
             p_ptrs,
             g_ptrs,
@@ -240,11 +314,14 @@ if _TRITON_OK:
             work_tid,
             work_off,
             step_ptr,
+            sqsum,
             float(lr),
             float(beta1),
             float(beta2),
             float(weight_decay),
             float(eps),
+            float(clip_max_norm),
+            CLIP=clip,
             BLOCK=block,
             num_warps=8,
         )
@@ -267,6 +344,7 @@ def adamw_step(
     beta2: float,
     weight_decay: float,
     eps: float,
+    clip_max_norm: float = 0.0,
     cache: dict[str, Any] | None = None,
 ) -> None:
     """Dispatch: Triton multi-tensor on CUDA, pure-torch ref otherwise."""
@@ -287,6 +365,7 @@ def adamw_step(
             beta2=beta2,
             weight_decay=weight_decay,
             eps=eps,
+            clip_max_norm=clip_max_norm,
             cache=cache,
         )
     else:
@@ -301,6 +380,7 @@ def adamw_step(
             beta2=beta2,
             weight_decay=weight_decay,
             eps=eps,
+            clip_max_norm=clip_max_norm,
         )
 
 
@@ -324,6 +404,7 @@ class FusedAdamW(Optimizer):
         weight_decay: float = 1e-2,
         *,
         maximize: bool = False,
+        clip_max_norm: float = 0.0,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be scalar")
@@ -353,6 +434,12 @@ class FusedAdamW(Optimizer):
             decoupled_weight_decay=True,
         )
         super().__init__(params, defaults)
+        # Fused global-norm grad clip (0 = off). Attribute, NOT a group
+        # default: keeps state_dict schema identical to torch fused AdamW.
+        # Only supported with a single param group (global norm semantics).
+        if clip_max_norm > 0.0 and len(self.param_groups) > 1:
+            raise ValueError("clip_max_norm requires a single param group")
+        self.fused_clip_max_norm = float(clip_max_norm)
         # per-group launch caches (pointer tables / work lists)
         self._launch_caches: list[dict[str, Any]] = [{} for _ in self.param_groups]
 
@@ -449,6 +536,7 @@ class FusedAdamW(Optimizer):
                 beta2=float(beta2),
                 weight_decay=weight_decay,
                 eps=eps,
+                clip_max_norm=getattr(self, "fused_clip_max_norm", 0.0),
                 cache=self._launch_caches[gi],
             )
         return loss
@@ -469,10 +557,19 @@ def build_adamw(
     lr: float,
     weight_decay: float,
     device_type: str,
+    clip_max_norm: float = 0.0,
 ) -> Optimizer:
-    """Build AdamW for training: FusedAdamW on CUDA when PAN2_FUSED_ADAMW=1."""
+    """Build AdamW for training: FusedAdamW on CUDA when PAN2_FUSED_ADAMW=1.
+
+    clip_max_norm > 0 folds global-norm grad clipping into the fused step
+    (callers must then SKIP clip_grad_norm_; check `fused_clip_max_norm`).
+    Ignored on the stock-torch fallback path, which returns an optimizer
+    without the attribute so callers keep clipping explicitly.
+    """
     if device_type == "cuda" and _env_wants_fused(default=True):
-        return FusedAdamW(params, lr=lr, weight_decay=weight_decay)
+        return FusedAdamW(
+            params, lr=lr, weight_decay=weight_decay, clip_max_norm=clip_max_norm
+        )
     return torch.optim.AdamW(
         params,
         lr=lr,

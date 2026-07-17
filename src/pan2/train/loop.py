@@ -48,12 +48,16 @@ def build_state(cfg: Config) -> TrainState:
         mode = os.environ.get("PAN2_MODEL_COMPILE_MODE", "default")
         model = torch.compile(model, mode=mode, fullgraph=False)  # type: ignore[assignment]
     # PAN2_FUSED_ADAMW=1 (default): multi-tensor Triton AdamW on CUDA;
-    # =0: stock torch.optim.AdamW (fused=True on CUDA).
+    # =0: stock torch.optim.AdamW (fused=True on CUDA). Grad clipping is
+    # folded into the fused step (clip_grad_norm_ held the GIL for ~15% of
+    # wall under producer contention, py-spy 2026-07-17); train_steps skips
+    # its explicit clip when the optimizer reports fused_clip_max_norm.
     optim = build_adamw(
         model.parameters(),
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
         device_type=device.type,
+        clip_max_norm=max(0.0, float(cfg.train.grad_clip)),
     )
     return TrainState(model=model, optim=optim, device=device, raw_model=raw_model)
 
@@ -107,7 +111,10 @@ def train_steps(
             raise RuntimeError(
                 f"non-finite loss at step {state.step + 1} (stage={cfg.train.stage})"
             )
-        if cfg.train.grad_clip > 0:
+        if (
+            cfg.train.grad_clip > 0
+            and getattr(state.optim, "fused_clip_max_norm", 0.0) <= 0.0
+        ):
             torch.nn.utils.clip_grad_norm_(state.model.parameters(), cfg.train.grad_clip)
         state.optim.step()
         state.step += 1

@@ -316,3 +316,73 @@ def test_train_state_ckpt_schema_compatible() -> None:
     assert set(st_o.keys()) == set(st_t.keys()) == {"step", "exp_avg", "exp_avg_sq"}
     assert st_o["step"].dtype == torch.float32
     assert st_o["step"].device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA fused clip")
+def test_fused_clip_matches_clip_grad_norm_plus_torch_adamw() -> None:
+    """FusedAdamW(clip_max_norm) == clip_grad_norm_ + torch AdamW(fused)."""
+    device = "cuda"
+    torch.manual_seed(3)
+    shapes = [(512,), (256, 512), (32, 3, 7, 7), (11,)]
+    base = [torch.randn(*s, device=device) for s in shapes]
+
+    p_t = [torch.nn.Parameter(b.clone()) for b in base]
+    p_f = [torch.nn.Parameter(b.clone()) for b in base]
+    opt_t = torch.optim.AdamW(p_t, lr=3e-4, weight_decay=0.01, fused=True)
+    opt_f = FusedAdamW(p_f, lr=3e-4, weight_decay=0.01, clip_max_norm=1.0)
+
+    for step in range(10):
+        g = [torch.randn_like(b) * (10.0 if step % 3 == 0 else 0.1) for b in base]
+        for p, gg in zip(p_t, g, strict=True):
+            p.grad = gg.clone()
+        for p, gg in zip(p_f, g, strict=True):
+            p.grad = gg.clone()
+        torch.nn.utils.clip_grad_norm_(p_t, 1.0)
+        opt_t.step()
+        opt_f.step()
+        opt_t.zero_grad(set_to_none=True)
+        opt_f.zero_grad(set_to_none=True)
+
+    for a, b in zip(p_t, p_f, strict=True):
+        assert _max_abs(a.detach(), b.detach()) <= 1e-5
+
+
+def test_fused_clip_ref_matches_clip_grad_norm() -> None:
+    """Ref path: clip folded into adamw_step_ref == explicit clip + ref step."""
+    from pan2.kernels.fused_adamw import adamw_step_ref
+
+    torch.manual_seed(4)
+    shapes = [(64,), (16, 8)]
+    base = [torch.randn(*s) for s in shapes]
+    grads = [torch.randn(*s) * 5.0 for s in shapes]
+    kwargs = dict(lr=1e-3, beta1=0.9, beta2=0.999, weight_decay=0.01, eps=1e-8)
+
+    p_a = [b.clone() for b in base]
+    g_a = [torch.nn.Parameter(b.clone()) for b in base]
+    for gp, g in zip(g_a, grads, strict=True):
+        gp.grad = g.clone()
+    torch.nn.utils.clip_grad_norm_(g_a, 1.0)
+    m_a = [torch.zeros_like(b) for b in base]
+    v_a = [torch.zeros_like(b) for b in base]
+    s_a = [torch.zeros(()) for _ in base]
+    adamw_step_ref(p_a, [gp.grad for gp in g_a], m_a, v_a, s_a, **kwargs)
+
+    p_b = [b.clone() for b in base]
+    m_b = [torch.zeros_like(b) for b in base]
+    v_b = [torch.zeros_like(b) for b in base]
+    s_b = [torch.zeros(()) for _ in base]
+    adamw_step_ref(
+        p_b, [g.clone() for g in grads], m_b, v_b, s_b, clip_max_norm=1.0, **kwargs
+    )
+
+    for a, b in zip(p_a, p_b, strict=True):
+        assert _max_abs(a, b) <= 1e-6
+
+
+def test_fused_clip_rejects_multiple_groups() -> None:
+    a = torch.nn.Parameter(torch.randn(4))
+    b = torch.nn.Parameter(torch.randn(4))
+    with pytest.raises(ValueError):
+        FusedAdamW(
+            [{"params": [a]}, {"params": [b]}], lr=1e-3, clip_max_norm=1.0
+        )

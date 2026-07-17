@@ -64,6 +64,27 @@ def _make_optim(impl: str, params, lr: float, weight_decay: float):
         from pan2.kernels.fused_adamw import FusedAdamW
 
         return FusedAdamW(params, lr=lr, weight_decay=weight_decay)
+    if impl == "ours-clip":
+        from pan2.kernels.fused_adamw import FusedAdamW
+
+        return FusedAdamW(
+            params, lr=lr, weight_decay=weight_decay, clip_max_norm=1.0
+        )
+    if impl == "torch-clip":
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=True)
+
+        class _ClipWrap:
+            def __init__(self, opt, params):
+                self.opt, self.params = opt, params
+
+            def step(self):
+                torch.nn.utils.clip_grad_norm_(self.params, 1.0)
+                self.opt.step()
+
+            def zero_grad(self, **kw):
+                self.opt.zero_grad(**kw)
+
+        return _ClipWrap(opt, params)
     raise ValueError(impl)
 
 
@@ -92,7 +113,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--impl",
-        choices=("torch", "foreach", "ours", "both", "all"),
+        choices=("torch", "foreach", "ours", "torch-clip", "ours-clip", "both", "all", "clip"),
         default="all",
     )
     p.add_argument("--warm", type=int, default=20)
@@ -117,6 +138,8 @@ def main() -> None:
         impls = ["torch", "ours"]
     elif args.impl == "all":
         impls = ["torch", "foreach", "ours"]
+    elif args.impl == "clip":
+        impls = ["torch-clip", "ours-clip"]
     else:
         impls = [args.impl]
     results: dict[str, list[float]] = {}
