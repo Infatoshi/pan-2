@@ -1016,3 +1016,57 @@ same 196 episodes - fine for trend, not for bitwise ckpt comparison.
 arg-validation/empty-val/eval plumbing), ruff clean. Checkpoint
 selection stays manual (log-only eval); horizon-gap-binned accuracy is
 the v2 metric for wrong-horizon discrimination.
+
+## 2026-07-18 (pm) - Perf avenue: bs=256 (+28%), producer-isolation killed by measurement
+
+Clean GPU0 re-baseline (overnight-compute lease, box quiet): bs64 =
+29.95 ms/step, 2137 clips/s, 7.66 h-video/s (matches overnight 29.4).
+Two earlier numbers this session were CONTENTION GARBAGE and are worth
+recording as a warning: 50.4 and 67.5 ms/step measured while a
+leaseless verify_cuda --chain squatter pair held GPU0 at 100% util
+(someone's chained build verifier, outside the coordinator). Any wall
+number on this box needs a same-second nvidia-smi next to it.
+
+BATCH SCALING (clean): bs128 probing was polluted, bs256 = 93.96
+ms/step, 2724 clips/s, 9.76 h-video/s = +28% throughput. Fixed+linear
+fit of the pair: ~8.7 ms/step fixed + ~0.33 ms/row -> asymptote ~3000
+clips/s, bs384+ buys almost nothing. Adopted bs=256 in
+configs/pretrain_pack.yaml. LR STAYS 3e-4: 600-step A/B at equal clips,
+bs256: lr3e-4 -> train 1.92 / val_acc 0.165, lr6e-4 -> train 3.31 /
+val_acc 0.111. Per-clip learning at bs256 matches bs64 at equal clips,
+so the 28% is free throughput. InfoNCE chance moves to 1/(256+4) =
+0.0038 (eval print tracks batch size automatically).
+
+PRODUCER-ISOLATION V2 ITEM: KILLED. Steady-state py-spy --gil on the
+clean run: ~6% GIL occupancy total, no producer samples in 45s. The
+overnight "21.2 ms producers-stopped floor -> producer GIL contention
+~8 ms" inference was wrong - that floor was measured through fleet CPU
+load and GPU contention. At 6% GIL there is nothing to isolate; do not
+build producer process isolation.
+
+PRODUCTION KERNEL TABLE (torch.profiler on the real pipeline, bs64,
+GPU ~85-90% busy -> step is mostly device-bound): conv_gelu custom
+family 13.7 ms/step (~37%): fwd 3.9, wgrad 2.3, bwd epilogue 1.5,
+dgrad 1.1, wrappers 4.9 across 6 sites; cudagraph'd temporal fwd+bwd
+= 6.6; eager gemm glue outside the graphs = ~4.4 ms over ~74 calls;
+FusedAdamW = 1.6. Encoder-side compile of the eager segments is the
+only remaining launch-glue item (~1-2 ms class, optional). conv_gelu
+stays custom: bench on GPU0 (bench_conv_gelu.py) fused-vs-composition
+= stem 1.77x, b1 1.10x on Blackwell; a Blackwell block-size retune of
+the bwd kernels is the next-tier kernel item (medium effort).
+
+VAL-LOADER BUG found by the A/B (would have bitten the real run):
+bs>=128 made _wait_for_fill need 2*bs ready slots but the val ring
+budget held 197 -> deadlock timeout. Val ring budget is now derived
+from batch size (>= 3*bs slots) in train_pretrain_pipeline.py. Also
+fixed: final eval double-fired when max_steps landed on the eval grid.
+
+Housekeeping: wrapper-validation checkpoints (step 500..4300, from the
+overnight launcher validation) moved out of the production ckpt_dir to
+data/checkpoints/pack_pretrain_wrapval/ - a real launch with
+--resume auto would otherwise silently resume at step 4300.
+pack_pretrain/ is now empty and fresh-run-safe.
+
+100 tests passing, ruff clean. Next perf tier, unscheduled: conv_gelu
+bwd Blackwell retune (~10 ms/step family), encoder eager-segment
+compile (~1-2 ms), bs384 probe near the asymptote.

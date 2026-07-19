@@ -124,14 +124,24 @@ def main() -> None:
     loader = PipelinedGpuPretrainLoader(pcfg)
 
     # Held-out val loader: same episode hash split, frozen ring (refresh=0)
-    # so every checkpoint scores the same windows. Small budget is fine - it
-    # only refills once at startup.
+    # so every checkpoint scores the same windows. Ring must hold >= 2*bs
+    # slots (batches sample distinct slots); size the budget to the batch.
     val_loader = None
     if cfg.train.eval_every > 0 and cfg.train.heldout_frac > 0:
+        from pan2.data.gpu_pipeline import _subsample_indices
+
+        t_slot = len(_subsample_indices(cfg.model.context_len, data_sub)) + 1 + max(
+            1, cfg.train.n_hard_negatives
+        )
+        val_budget_gb = max(
+            0.3,
+            (3 * cfg.train.batch_size * t_slot * 3 * cfg.model.image_size**2)
+            / float(2**30),
+        )
         vpcfg = dataclasses.replace(
             pcfg,
             split="val",
-            budget_gb=0.3,
+            budget_gb=val_budget_gb,
             num_producers=2,
             refresh_prob=0.0,
         )
@@ -167,7 +177,7 @@ def main() -> None:
                 save_ckpt(state, Path(cfg.train.ckpt_dir) / f"pretrain_step{state.step}.pt")
         # Step-stamped final save even off the ckpt_every grid, so a
         # rerun's --resume auto lands exactly here and exits fast.
-        if val_loader is not None:
+        if val_loader is not None and state.step % cfg.train.eval_every != 0:
             ev = eval_contrastive(state, cfg, gen_val(val_loader), cfg.train.eval_batches)
             chance = 1.0 / (cfg.train.batch_size + cfg.train.n_hard_negatives)
             print(
