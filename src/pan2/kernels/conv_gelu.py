@@ -543,6 +543,12 @@ class _ConvGelu(torch.autograd.Function):
                 OW=ow,
                 STRIDE=stride,
                 PADDING=padding,
+                # 2026-07-18 sm_120 sweep: configs with BLOCK_COL=8 or
+                # BLOCK_COUT<32 time fast but return WRONG dx (work-skipping
+                # loop structure in this kernel) - caught by
+                # test_conv_gelu_matches_fp32_reference. Keep the validated
+                # (16, 32, w8, s2) config; the sweep's apparent 2.7x was an
+                # artifact.
                 BLOCK_M=block_m,
                 BLOCK_COL=16,
                 BLOCK_COUT=32,
@@ -572,6 +578,10 @@ class _ConvGelu(torch.autograd.Function):
                 OW=ow,
                 STRIDE=stride,
                 PADDING=padding,
+                # 2026-07-18 sm_120 sweep: every non-default (BLOCK_CIN,
+                # BLOCK_COUT, warps, stages) variant fails
+                # test_kernel_conv_gelu (garbage dx past the block boundary;
+                # several also race). Keep the validated config.
                 BLOCK_M=block_m,
                 BLOCK_CIN=32,
                 BLOCK_COUT=32,
@@ -580,10 +590,18 @@ class _ConvGelu(torch.autograd.Function):
             )
         if need_dweight:
             assert dweight is not None
-            max_splits = 128 if cin == 3 else 64
+            # 2026-07-18 sm_120 retune: stem 6.13 -> 5.28 ms (R=64, splits 256,
+            # w4); b1 2.92 -> 2.12 ms (R=128, COUT=64, K=64, splits 32, w4)
+            max_splits = 256 if cin == 3 else 32
             splits = min(max_splits, triton.cdiv(n * oh * ow, 128))
+            block_cout = 32 if cin == 3 else 64
+            block_k = 32 if cin == 3 else 64
             _conv_gelu_wgrad_kernel[
-                (triton.cdiv(cout, 32), triton.cdiv(kh * kw * cin, 32), splits)
+                (
+                    triton.cdiv(cout, block_cout),
+                    triton.cdiv(kh * kw * cin, block_k),
+                    splits,
+                )
             ](
                 x,
                 dpre,
@@ -600,10 +618,10 @@ class _ConvGelu(torch.autograd.Function):
                 STRIDE=stride,
                 PADDING=padding,
                 SPLITS=splits,
-                BLOCK_R=128,
-                BLOCK_COUT=32,
-                BLOCK_K=32,
-                num_warps=8,
+                BLOCK_R=64 if cin == 3 else 128,
+                BLOCK_COUT=block_cout,
+                BLOCK_K=block_k,
+                num_warps=4,
             )
         return dx, None if dweight is None else dweight.to(weight.dtype), None, None
 

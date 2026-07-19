@@ -1070,3 +1070,53 @@ pack_pretrain/ is now empty and fresh-run-safe.
 100 tests passing, ruff clean. Next perf tier, unscheduled: conv_gelu
 bwd Blackwell retune (~10 ms/step family), encoder eager-segment
 compile (~1-2 ms), bs384 probe near the asymptote.
+
+## 2026-07-18 (evening): conv_gelu retune aftermath - most sweep wins were silent wrong-result artifacts
+
+Ran the three next-tier items from the pm entry. Two were dead ends, one
+landed small:
+
+1. conv_gelu Blackwell retune (scripts/tune_conv_gelu.py, offline
+   do_bench sweep at PRODUCTION shapes N=34,048 = bs256 x 133 images):
+   added two-phase protocol after the first sweep run died - CUDA
+   launch-blocking smoke pass to enumerate context-poisoning configs
+   (18 oversized-shmem variants), then a correctness-gated timing pass.
+   THE GATED PASS WAS THE REAL FINDING: 162/162 stem-dgrad variants and
+   ~18 b1-dgrad variants return WRONG dx (timer says up to 2.7x faster,
+   values are garbage - work-skipping block structure). Unit tests
+   killed every dgrad "win". Validated landing: wgrad only. Stem wgrad
+   (BLOCK_R=64, max_splits=256, warps=4): 6.125 -> 5.280 ms (1.16x);
+   b1 wgrad (BLOCK_COUT=64, BLOCK_K=64, max_splits=32, warps=4):
+   2.917 -> 2.115 ms (1.38x). Fwd/epilogue configs were already at the
+   measured optimum (winners within noise of current). End-to-end bs256
+   interleaved A/B: 84.67/83.29 vs 84.90/85.43 ms/step -> ~1-2% from
+   the wgrad retune; new steady state ~83-87 ms/step (run-to-run
+   spread, GPU otherwise idle, conv path ON). The family remains the
+   dominant device cost (fwd stem 5.1 + epi 4.4 + sdg ~5 + wg 5.4 at
+   N=34,048, per the sweep log); the dgrad/fwd kernels are at their
+   correct-config local optima - bigger gains need kernel rewrites,
+   not retunes.
+2. Encoder eager-segment compile (PAN2_ENCODER_COMPILE_MODE probe):
+   mode=default measured WORSE end-to-end (2384 vs 2724 clips/s,
+   -12.5%); graph-break overhead around the custom autograd Functions
+   beats the inductor fusion win. Hook removed from train/loop.py; the
+   eager gemm glue stays eager.
+3. bs=384/512 asymptote probe: 384 -> 170.9 ms (2246 clips/s), 512 ->
+   314.1 ms (1630 clips/s) vs 256 at ~3040 clips/s. Past-256 is a
+   scaler's wall on this GPU; batch stays 256.
+
+bench_conv_gelu.py SHAPES updated to production (N=34,048; the old
+2080/N values were bs32-era). Fused-vs-ref at production shapes with
+the new wgrad config: stem 1.90x, b1 1.11x - custom kernels still
+earn their keep on Blackwell.
+
+Lesson worth keeping: do_bench-only sweeps of hand-rolled backward
+kernels are UNSOUND - several "fast" configs were fast because they
+skip work. Any future retune must keep the correctness gate
+(tune_conv_gelu.py now has it) and unit tests are the final arbiter.
+
+100 tests passing, ruff clean. Lease pan2-perf2 released. Perf avenue
+is now genuinely thin: remaining measured headroom is the conv_gelu
+fwd/dgrad kernel rewrites (week-scale effort, uncertain payoff) or the
+producer/decoder side - recommend pausing perf here and going back to
+data/model work.

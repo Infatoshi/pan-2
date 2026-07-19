@@ -14,9 +14,11 @@ import torch
 from pan2 import kernels
 from pan2.train.speed import configure_cuda_fast_math
 
+# Production shapes, bs256 pack pretrain: N = 256 x (128 ctx + 1 goal + 4
+# hard negs) = 34,048 images per encoder batch (2026-07-18).
 SHAPES = {
-    "stem": ((2080, 3, 64, 64), (32, 3, 7, 7), 3),
-    "b1": ((2080, 32, 32, 32), (64, 32, 3, 3), 1),
+    "stem": ((34048, 3, 64, 64), (32, 3, 7, 7), 3),
+    "b1": ((34048, 32, 32, 32), (64, 32, 3, 3), 1),
 }
 
 
